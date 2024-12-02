@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Classes for the simulation of flat-fading channels"""
@@ -117,7 +117,7 @@ class ApplyFlatFadingChannel(tf.keras.layers.Layer):
 
     Output
     ------
-    y : [batch_size, num_rx_ant, num_tx_ant], ``dtype``
+    y : [batch_size, num_rx_ant], ``dtype``
         Channel output.
     """
     def __init__(self, add_awgn=True, dtype=tf.complex64, **kwargs):
@@ -211,7 +211,7 @@ class FlatFadingChannel(tf.keras.layers.Layer):
     (y, h) :
         Tuple or Tensor:
 
-    y : [batch_size, num_rx_ant, num_tx_ant], ``dtype``
+    y : [batch_size, num_rx_ant], ``dtype``
         Channel output.
 
     h : [batch_size, num_rx_ant, num_tx_ant], ``dtype``

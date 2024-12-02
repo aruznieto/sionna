@@ -9,6 +9,10 @@ dot
 ---
 .. autofunction:: sionna.rt.dot
 
+outer
+-----
+.. autofunction:: sionna.rt.outer
+
 normalize
 ---------
 .. autofunction:: sionna.rt.normalize
@@ -44,3 +48,11 @@ theta_hat
 theta_phi_from_unit_vec
 -----------------------
 .. autofunction:: sionna.rt.theta_phi_from_unit_vec
+
+watt_to_dbm
+-----------
+.. autofunction:: sionna.rt.watt_to_dbm
+
+dbm_to_watt
+-----------
+.. autofunction:: sionna.rt.dbm_to_watt

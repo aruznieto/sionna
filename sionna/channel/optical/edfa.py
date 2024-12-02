@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -9,7 +9,6 @@ This module defines a model for an Erbium-Doped Fiber Amplifier.
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
 import sionna
-
 
 class EDFA(Layer):
     # pylint: disable=line-too-long
@@ -163,12 +162,12 @@ class EDFA(Layer):
 
         # Calculate noise signal with given noise power
         n = tf.complex(
-            tf.random.normal(
+            sionna.config.tf_rng.normal(
                 tf.shape(x),
                 tf.cast(0.0, self._rdtype),
                 tf.sqrt(self._p_n_ase / tf.cast(2.0, self._rdtype)),
                 self._rdtype),
-            tf.random.normal(
+            sionna.config.tf_rng.normal(
                 tf.shape(x),
                 tf.cast(0.0, self._rdtype),
                 tf.sqrt(self._p_n_ase / tf.cast(2.0, self._rdtype)),

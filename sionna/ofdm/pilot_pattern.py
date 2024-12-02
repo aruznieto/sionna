@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Class definition and functions related to pilot patterns"""
@@ -335,7 +335,7 @@ class KroneckerPilotPattern(PilotPattern):
 
         # Compute the length of a pilot sequence
         num_pilots = num_pilot_symbols*num_effective_subcarriers/num_seq
-        assert num_pilots%1==0, \
+        assert (num_pilots/num_pilot_symbols)%1==0, \
             """`num_effective_subcarriers` must be an integer multiple of
             `num_tx`*`num_streams_per_tx`."""
 

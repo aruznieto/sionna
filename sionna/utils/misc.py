@@ -1,19 +1,19 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Miscellaneous utility functions of the Sionna package."""
 
+import time
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
 from tensorflow.experimental.numpy import log10 as _log10
 from tensorflow.experimental.numpy import log2 as _log2
+import sionna
 from sionna.utils.metrics import count_errors, count_block_errors
 from sionna.mapping import Mapper, Constellation
-import time
 from sionna import signal
-
 
 def ebnodb2no(ebno_db, num_bits_per_symbol, coderate, resource_grid=None):
     r"""Compute the noise variance `No` for a given `Eb/No` in dB.
@@ -86,7 +86,6 @@ def ebnodb2no(ebno_db, num_bits_per_symbol, coderate, resource_grid=None):
 
     return no
 
-
 def hard_decisions(llr):
     """Transforms LLRs into hard decisions.
 
@@ -107,7 +106,6 @@ def hard_decisions(llr):
 
     return tf.cast(tf.math.greater(llr, zero), dtype=llr.dtype)
 
-
 def log10(x):
     # pylint: disable=C0301
     """TensorFlow implementation of NumPy's `log10` function.
@@ -118,7 +116,6 @@ def log10(x):
     """
     return tf.cast(_log10(x), x.dtype)
 
-
 def log2(x):
     # pylint: disable=C0301
     """TensorFlow implementation of NumPy's `log2` function.
@@ -128,7 +125,6 @@ def log2(x):
     For more details see the `TensorFlow <https://www.tensorflow.org/api_docs/python/tf/experimental/numpy/log2>`_ and `NumPy <https://numpy.org/doc/1.16/reference/generated/numpy.log2.html>`_ documentation.
     """
     return tf.cast(_log2(x), x.dtype)
-
 
 class BinarySource(Layer):
     """BinarySource(dtype=tf.float32, seed=None, **kwargs)
@@ -160,14 +156,12 @@ class BinarySource(Layer):
         self._seed = seed
         if self._seed is not None:
             self._rng = tf.random.Generator.from_seed(self._seed)
+        else:
+            self._rng = sionna.config.tf_rng
 
     def call(self, inputs):
-        if self._seed is not None:
-            return tf.cast(self._rng.uniform(inputs, 0, 2, tf.int32),
-                           dtype=super().dtype)
-        else:
-            return tf.cast(tf.random.uniform(inputs, 0, 2, tf.int32),
-                           dtype=super().dtype)
+        return tf.cast(self._rng.uniform(inputs, 0, 2, tf.int32),
+                       dtype=super().dtype)
 
 class SymbolSource(Layer):
     # pylint: disable=line-too-long
@@ -268,7 +262,6 @@ class SymbolSource(Layer):
             result.append(b)
 
         return result
-
 
 class QAMSource(SymbolSource):
     # pylint: disable=line-too-long
@@ -398,7 +391,6 @@ class PAMSource(SymbolSource):
                          dtype=dtype,
                          **kwargs)
 
-
 def sim_ber(mc_fun,
             ebno_dbs,
             batch_size,
@@ -498,20 +490,22 @@ def sim_ber(mc_fun,
         If `False`, the simulation ends and returns the intermediate simulation
         results.
 
-    callback: callable
-        Defaults to `None`. If specified, ``callback``
-        will be called after each Monte-Carlo step. Can be used for
-        logging or advanced early stopping.
-        Input signature of ``callback`` must match `callback(mc_iter,
-        ebno_dbs, bit_errors, block_errors, nb_bits, nb_blocks)` where
-        ``mc_iter`` denotes the number of processed batches for the current
-        SNR, ``ebno_dbs`` is the current SNR point, ``bit_errors`` the number
-        of bit errors, ``block_errors`` the number of block errors, ``nb_bits``
-        the number of simulated bits, ``nb_blocks`` the number of simulated
-        blocks. If ``callable`` returns `sim_ber.CALLBACK_NEXT_SNR`, early
-        stopping is detected and the simulation will continue with the next SNR
-        point. If ``callable`` returns `sim_ber.CALLBACK_STOP`, the simulation
-        is stopped immediately. For `sim_ber.CALLBACK_CONTINUE` continues with
+    callback: `None` (default) | callable
+        If specified, ``callback`` will be called after each Monte-Carlo step.
+        Can be used for logging or advanced early stopping. Input signature of
+        ``callback`` must match `callback(mc_iter, snr_idx, ebno_dbs,
+        bit_errors, block_errors, nb_bits, nb_blocks)` where ``mc_iter``
+        denotes the number of processed batches for the current SNR point,
+        ``snr_idx`` is the index of the current SNR point, ``ebno_dbs`` is the
+        vector of all SNR points to be evaluated, ``bit_errors`` the vector of
+        number of bit errors for each SNR point, ``block_errors`` the vector of
+        number of block errors, ``nb_bits`` the vector of number of simulated
+        bits, ``nb_blocks`` the vector of number of simulated blocks,
+        respectively. If ``callable`` returns `sim_ber.CALLBACK_NEXT_SNR`, early
+        stopping is detected and the simulation will continue with the
+        next SNR point. If ``callable`` returns
+        `sim_ber.CALLBACK_STOP`, the simulation is stopped
+        immediately. For `sim_ber.CALLBACK_CONTINUE` continues with
         the simulation.
 
     dtype: tf.complex64
@@ -674,6 +668,9 @@ def sim_ber(mc_fun,
         raise TypeError("Unknown graph_mode selected.")
 
     # support multi-device simulations by using the tf.distribute package
+    if len(tf.config.list_logical_devices('GPU'))==0:
+        run_multigpu = False
+        distribute = None
     if distribute is None: # disabled per default
         run_multigpu = False
     # use strategy if explicitly provided
@@ -703,7 +700,7 @@ def sim_ber(mc_fun,
 
     # reduce max_mc_iter if multi_gpu simulations are activated
     if run_multigpu:
-        num_replicas = strategy.num_replicas_in_sync
+        num_replicas = strategy.num_replicas_in_sync # pylint: disable=possibly-used-before-assignment
         max_mc_iter = int(np.ceil(max_mc_iter/num_replicas))
         print(f"Distributing simulation across {num_replicas} devices.")
         print(f"Reducing max_mc_iter to {max_mc_iter}")
@@ -776,9 +773,9 @@ def sim_ber(mc_fun,
 
                 cb_state = sim_ber.CALLBACK_CONTINUE
                 if callback is not None:
-                    cb_state = callback (ii, ebno_dbs[i], bit_errors[i],
-                                       block_errors[i], nb_bits[i],
-                                       nb_blocks[i])
+                    cb_state = callback (ii, i, ebno_dbs, bit_errors,
+                                       block_errors, nb_bits,
+                                       nb_blocks)
                     if cb_state in (sim_ber.CALLBACK_STOP,
                                     sim_ber.CALLBACK_NEXT_SNR):
                         # stop runtime timer
@@ -927,8 +924,10 @@ def complex_normal(shape, var=1.0, dtype=tf.complex64):
     stddev = tf.sqrt(var_dim)
 
     # Generate complex Gaussian noise with the right variance
-    xr = tf.random.normal(shape, stddev=stddev, dtype=dtype.real_dtype)
-    xi = tf.random.normal(shape, stddev=stddev, dtype=dtype.real_dtype)
+    xr = sionna.config.tf_rng.normal(shape, stddev=stddev,
+                                     dtype=dtype.real_dtype)
+    xi = sionna.config.tf_rng.normal(shape, stddev=stddev,
+                                     dtype=dtype.real_dtype)
     x = tf.complex(xr, xi)
 
     return x

@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """
@@ -10,15 +10,16 @@ import drjit as dr
 import matplotlib
 import mitsuba as mi
 import numpy as np
+import tensorflow as tf
 
 from .camera import Camera
-from .utils import paths_to_segments, scene_scale
+from .utils import paths_to_segments, scene_scale, mitsuba_rectangle_to_world
 
 
 def render(scene, camera, paths, show_paths, show_devices, num_samples,
            resolution, fov,
-           coverage_map=None, cm_tx=0, cm_db_scale=True,
-           cm_vmin=None, cm_vmax=None):
+           coverage_map=None, cm_tx=None, cm_db_scale=True,
+           cm_vmin=None, cm_vmax=None, cm_metric="path_gain"):
     r"""
     Renders two images with path tracing:
     1. Base scene with the meshes
@@ -49,11 +50,12 @@ def render(scene, camera, paths, show_paths, show_devices, num_samples,
         An optional coverage map to overlay in the scene for visualization.
         Defaults to `None`.
 
-    cm_tx : int | str
+    cm_tx : int | str | None
         When `coverage_map` is specified, controls which of the transmitters
         to display the coverage map for. Either the transmitter's name
-        or index can be given.
-        Defaults to `0`.
+        or index can be given. If `None`, the maximum metric over all
+        transmitters is shown.
+        Defaults to `None`.
 
     cm_db_scale: bool
         Use logarithmic scale for coverage map visualization, i.e. the
@@ -66,6 +68,10 @@ def render(scene, camera, paths, show_paths, show_devices, num_samples,
         the colormap covers.
         If set to None, then covers the complete range.
         Defaults to `None`.
+
+    cm_metric : str, one of ["path_gain", "rss", "sinr"]
+        Metric of the coverage map to be displayed.
+        Defaults to `path_gain`.
 
     num_samples : int
         Number of rays thrown per pixel.
@@ -101,7 +107,7 @@ def render(scene, camera, paths, show_paths, show_devices, num_samples,
         if coverage_map is not None:
             coverage_map = _coverage_map_to_textured_rectangle(
                 coverage_map, tx=cm_tx, db_scale=cm_db_scale,
-                vmin=cm_vmin, vmax=cm_vmax,
+                vmin=cm_vmin, vmax=cm_vmax, cm_metric=cm_metric,
                 viewpoint=sensor.world_transform().translation())
 
         s2 = results_to_mitsuba_scene(scene, paths=paths,
@@ -267,11 +273,15 @@ def results_to_mitsuba_scene(scene, paths, show_paths, show_devices,
     objects = {
         'type': 'scene',
     }
-    sc, tx_positions, rx_positions, _ = scene_scale(scene)
+    sc, tx_positions, rx_positions, ris_positions, _ = scene_scale(scene)
+    ris_orientations = [ris.orientation for ris in scene.ris.values()]
+    ris_sizes = [ris.size for ris in scene.ris.values()]
     transmitter_colors = [transmitter.color.numpy() for
                           transmitter in scene.transmitters.values()]
     receiver_colors = [receiver.color.numpy() for
                        receiver in scene.receivers.values()]
+    ris_colors = [ris.color.numpy() for
+                           ris in scene.ris.values()]
 
     # --- Radio devices, shown as spheres
     if show_devices:
@@ -290,6 +300,23 @@ def results_to_mitsuba_scene(scene, paths, show_paths, show_devices,
                         'radiance': {'type': 'rgb', 'value': color[index]},
                     },
                 }
+
+    # --- RIS, shown as rectangles
+    if show_devices:
+        for k, o, s, c in zip(ris_positions, ris_orientations, ris_sizes,
+                              ris_colors):
+            p = tf.constant(ris_positions[k])
+            key = 'ris-' + k
+            assert key not in objects
+            to_world = mitsuba_rectangle_to_world(p, o, s, ris=True)
+            objects[key] = {
+                'type': 'rectangle',
+                'to_world': to_world,
+                'light': {
+                    'type': 'area',
+                    'radiance': {'type': 'rgb', 'value': c},
+                },
+            }
 
     # --- Paths, shown as cylinders (the closest we have to lines)
     if (paths is not None) and show_paths:
@@ -325,12 +352,19 @@ def results_to_mitsuba_scene(scene, paths, show_paths, show_devices,
 
 def _coverage_map_to_textured_rectangle(coverage_map, tx=0, db_scale=True,
                                         vmin=None, vmax=None,
+                                        cm_metric="path_gain",
                                         viewpoint=None):
     to_world = coverage_map.to_world()
     # Resample values from cell centers to cell corners
-    coverage_map = resample_to_corners(
-        coverage_map[tx, :, :].numpy().squeeze()
-    )
+    cm = getattr(coverage_map, cm_metric).numpy()
+    if tx is None:
+        cm = np.max(cm, axis=0)
+    else:
+        cm = cm[tx]
+    # Ensure that dBm is correctly computed for RSS
+    if cm_metric=="rss" and db_scale:
+        cm *= 1000
+    coverage_map = resample_to_corners(cm.squeeze())
 
     texture, opacity = _coverage_map_texture(
         coverage_map, db_scale=db_scale, vmin=vmin, vmax=vmax)
@@ -393,7 +427,7 @@ def coverage_map_color_mapping(coverage_map, db_scale=True,
     if vmax is None:
         vmax = coverage_map[valid].max()
     normalizer = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
-    color_map = matplotlib.cm.get_cmap('viridis')
+    color_map = matplotlib.colormaps.get_cmap('viridis')
     return coverage_map, normalizer, color_map
 
 

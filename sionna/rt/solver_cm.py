@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """
@@ -11,13 +11,16 @@ import mitsuba as mi
 import drjit as dr
 import tensorflow as tf
 from sionna.constants import PI
+from sionna import config
 from sionna.utils.tensors import expand_to_rank, insert_dims, flatten_dims
-from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
+from .utils import dot, outer, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, rotation_matrix, mi_to_tf_tensor, compute_field_unit_vectors,\
-        reflection_coefficient, component_transform, fibonacci_lattice, r_hat,\
-            cross, cot, sign, sample_points_on_hemisphere, acos_diff
+    reflection_coefficient, component_transform, fibonacci_lattice, r_hat,\
+    cross, cot, sign, sample_points_on_hemisphere, acos_diff, gen_basis_from_z,\
+    compute_spreading_factor, mitsuba_rectangle_to_world,\
+        angles_to_mitsuba_rotation
 from .solver_base import SolverBase
-from .coverage_map import CoverageMap, coverage_map_rectangle_to_world
+from .coverage_map import CoverageMap
 from .scattering_pattern import ScatteringPattern
 
 
@@ -100,12 +103,14 @@ class SolverCoverageMap(SolverBase):
         (in the local X direction) and height (in the local Y direction) in
         meters of a cell of the coverage map
 
-    combining_vec : [num_rx_ant], tf.complex
+    combining_vec : [num_rx_ant], tf.complex | None
         Combining vector.
         This is used to combine the signal from the receive antennas for
         an imaginary receiver located on the coverage map.
+        If set to `None`, then no combining is applied, and
+        the energy received by all antennas is summed.
 
-    precoding_vec : [num_tx or 1, num_tx_ant], tf.complex
+    precoding_vec : [num_tx, num_tx_ant], tf.complex
         Precoding vectors of the transmitters
 
     num_samples : int
@@ -125,9 +130,18 @@ class SolverCoverageMap(SolverBase):
     scattering : bool
         if set to `True`, then the scattered paths are computed.
 
+    ris : bool
+        If set to `True`, then paths involving RIS are computed.
+
     edge_diffraction : bool
         If set to `False`, only diffraction on wedges, i.e., edges that
         connect two primitives, is considered.
+
+    num_runs : int, >= 1
+        Number of runs of the coverage map solver executed. The returned
+        coverage map is the average of all runs.
+        If greater than one, then a random rotation is applied to the Fibonacci
+        lattice at each run.
 
     Output
     -------
@@ -135,10 +149,17 @@ class SolverCoverageMap(SolverBase):
         The coverage maps
     """
 
+    DISCARD_THRES = 1e-15 # -150 dB
+
     def __call__(self, max_depth, rx_orientation,
                  cm_center, cm_orientation, cm_size, cm_cell_size,
                  combining_vec, precoding_vec, num_samples,
-                 los, reflection, diffraction, scattering, edge_diffraction):
+                 los, reflection, diffraction, scattering, ris,
+                 edge_diffraction, num_runs):
+
+        if num_runs < 1:
+            raise ValueError("The number of runs must be greater or equal to 1")
+        random_lattice = num_runs > 1
 
         # If reflection and scattering are disabled, no need for a max_depth
         # higher than 1.
@@ -146,7 +167,7 @@ class SolverCoverageMap(SolverBase):
         if (not reflection) and (not scattering):
             max_depth = tf.minimum(max_depth, 1)
 
-        # Transmitters positions and orientations
+        # Transmitters positions, orientations and tx power
         # sources_positions : [num_tx, 3]
         # sources_orientations : [num_tx, 3]
         sources_positions = []
@@ -176,44 +197,55 @@ class SolverCoverageMap(SolverBase):
                                                       cm_orientation,
                                                       cm_size)
 
-        ####################################################
-        # Shooting-and-bouncing
-        # Computes the coverage map for LoS, reflection,
-        # and scattering.
-        # Also returns the primitives found in LoS of the
-        # transmitters to shoot diffracted rays.
-        ####################################################
+        # Builds the Mitsuba scene with RIS for
+        # testing intersections with RIS
+        mi_ris_objects, mi_ris_indices = self._build_mi_ris_objects()
 
-        cm, los_primitives = self._shoot_and_bounce(meas_plane,
-                                                    rx_orientation,
-                                                    sources_positions,
-                                                    sources_orientations,
-                                                    max_depth,
-                                                    num_samples,
-                                                    combining_vec,
-                                                    precoding_vec,
-                                                    cm_center,
-                                                    cm_orientation,
-                                                    cm_size,
-                                                    cm_cell_size,
-                                                    los,
-                                                    reflection,
-                                                    diffraction,
-                                                    scattering,
-                                                    etas,
-                                                    scattering_coefficient,
-                                                    xpd_coefficient,
-                                                    alpha_r,
-                                                    alpha_i,
-                                                    lambda_)
+        cms = []
+        for _ in range(num_runs):
 
-        # ############################################
-        # # Diffracted
-        # ############################################
+            ####################################################
+            # Shooting-and-bouncing
+            # Computes the coverage map for LoS, reflection,
+            # and scattering.
+            # Also returns the primitives found in LoS of the
+            # transmitters to shoot diffracted rays.
+            ####################################################
 
-        if los_primitives is not None:
+            cm, los_primitives = self._shoot_and_bounce(meas_plane,
+                                                        mi_ris_objects,
+                                                        mi_ris_indices,
+                                                        rx_orientation,
+                                                        sources_positions,
+                                                        sources_orientations,
+                                                        max_depth,
+                                                        num_samples,
+                                                        combining_vec,
+                                                        precoding_vec,
+                                                        cm_center,
+                                                        cm_orientation,
+                                                        cm_size,
+                                                        cm_cell_size,
+                                                        los,
+                                                        reflection,
+                                                        diffraction,
+                                                        scattering,
+                                                        ris,
+                                                        etas,
+                                                        scattering_coefficient,
+                                                        xpd_coefficient,
+                                                        alpha_r,
+                                                        alpha_i,
+                                                        lambda_,
+                                                        random_lattice)
 
-            cm_diff = self._diff_samples_2_coverage_map(los_primitives,
+            # ############################################
+            # # Diffracted
+            # ############################################
+
+            if los_primitives is not None:
+
+                cm_diff = self._diff_samples_2_coverage_map(los_primitives,
                                                         edge_diffraction,
                                                         num_samples,
                                                         sources_positions,
@@ -229,7 +261,12 @@ class SolverCoverageMap(SolverBase):
                                                         etas,
                                                         scattering_coefficient)
 
-            cm = cm + cm_diff
+                cm = cm + cm_diff
+            cms.append(cm)
+
+        # Average over all runs
+        cms = tf.stack(cms, axis=0)
+        cm = tf.reduce_mean(cms, axis=0)
 
         # ############################################
         # # Combine the coverage maps.
@@ -274,9 +311,9 @@ class SolverCoverageMap(SolverBase):
         # Rectangle defining the coverage map
         mi_meas_plane = mi.load_dict({
             'type': 'rectangle',
-            'to_world': coverage_map_rectangle_to_world(cm_center,
-                                                        cm_orientation,
-                                                        cm_size),
+            'to_world': mitsuba_rectangle_to_world(cm_center,
+                                                   cm_orientation,
+                                                   cm_size),
         })
 
         return mi_meas_plane
@@ -527,7 +564,8 @@ class SolverCoverageMap(SolverBase):
                              rot_gcs_2_mp, cm_normal, tx_rot_mat,
                              rx_rot_mat, precoding_vec, combining_vec,
                              samples_tx_indices, e_field, field_es, field_ep,
-                             mp_hit_point, hit_mp, k_tx, previous_int_point,cm):
+                             mp_hit_point, hit_mp, k_tx, previous_int_point, cm,
+                             ris, radii_curv, angular_opening):
         r"""
         Updates the coverage map with the power of the paths that hit it.
 
@@ -561,14 +599,16 @@ class SolverCoverageMap(SolverBase):
         rx_rot_mat : [3, 3], tf.float
             Rotation matrix built from the orientation of the receivers
 
-        precoding_vec : [num_tx, num_tx_ant] or [1, num_tx_ant], tf.complex
+        precoding_vec : [num_tx, num_tx_ant], tf.complex
             Vector used for transmit-precoding
 
-        combining_vec : [num_rx_ant], tf.complex
-            Vector used for receive-combing
+        combining_vec : [num_rx_ant], tf.complex | None
+            Vector used for receive-combing.
+            If set to `None`, then no combining is applied, and
+            the energy received by all antennas is summed.
 
         samples_tx_indices : [num_samples], tf.int
-            Transmitter indices that correspond to evey sample, i.e., from
+            Transmitter indices that correspond to every sample, i.e., from
             which the ray was shot.
 
         e_field : [num_samples, num_tx_patterns, 2], tf.float
@@ -595,6 +635,15 @@ class SolverCoverageMap(SolverBase):
 
         cm : [num_tx, num_cells_y+1, num_cells_x+1], tf.float
             Coverage map
+
+        ris : bool
+            Set to `True` if RIS are enabled
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening of the ray tube
 
         Output
         -------
@@ -628,6 +677,11 @@ class SolverCoverageMap(SolverBase):
         field_es = tf.gather(field_es, hit_mp_ind, axis=0)
         # [num_hits, 3]
         field_ep = tf.gather(field_ep, hit_mp_ind, axis=0)
+        if ris:
+            # [num_hits, 2]
+            radii_curv = tf.gather(radii_curv, hit_mp_ind, axis=0)
+            # [num_hits]
+            angular_opening = tf.gather(angular_opening, hit_mp_ind, axis=0)
 
         # Cell indices
         # [num_hits, 2]
@@ -636,7 +690,19 @@ class SolverCoverageMap(SolverBase):
                                                   num_cells, mp_hit_point)
         # Receive direction
         # k_rx : [num_hits, 3]
-        k_rx,_ = normalize(mp_hit_point - previous_int_point)
+        # length : [num_hits]
+        k_rx,length = normalize(mp_hit_point - previous_int_point)
+
+        if ris:
+            # Apply spreading factor
+            # [num_active_samples]
+            sf = compute_spreading_factor(radii_curv[:,0], radii_curv[:,1],
+                                          length)
+            # [num_active_samples, 1, 1]
+            sf = expand_to_rank(sf, tf.rank(e_field), -1)
+            sf = tf.complex(sf, tf.zeros_like(sf))
+            # [num_active_samples, num_tx_patterns, 2]
+            e_field *= sf
 
         # Compute the receive field in the GCS
         # rx_field : [num_hits, num_rx_patterns, 2]
@@ -658,6 +724,7 @@ class SolverCoverageMap(SolverBase):
         rx_field = tf.expand_dims(rx_field, axis=2)
         # [num_hits, 1, num_tx_patterns, 2]
         e_field = tf.expand_dims(e_field, axis=1)
+
         # [num_hits, num_rx_patterns, num_tx_patterns]
         a = tf.reduce_sum(tf.math.conj(rx_field)*e_field, axis=-1)
 
@@ -666,19 +733,25 @@ class SolverCoverageMap(SolverBase):
         a = self._apply_synthetic_array(tx_rot_mat, rx_rot_mat,
                                         k_rx, k_tx, a)
 
-        # Apply precoding and combining
-        # [1, num_rx_ant]
-        combining_vec = tf.expand_dims(combining_vec, 0)
+        # Apply precoding
         # [num_hits, 1, num_tx_ant]
         precoding_vec = tf.expand_dims(precoding_vec, 1)
         # [num_hits, num_rx_ant]
         a = tf.reduce_sum(a*precoding_vec, axis=-1)
-        # [num_hits]
-        a = tf.reduce_sum(tf.math.conj(combining_vec)*a, axis=-1)
-
-        # Compute the amplitude of the path
-        # [num_hits]
-        a = tf.square(tf.abs(a))
+        # Apply combining
+        # If no combining vector is provided, then sum the energy received by
+        # the antennas
+        if combining_vec is None:
+            # [num_hits]
+            a = tf.reduce_sum(tf.square(tf.abs(a)), axis=-1)
+        else:
+            # [1, num_rx_ant]
+            combining_vec = tf.expand_dims(combining_vec, 0)
+            # [num_hits]
+            a = tf.reduce_sum(tf.math.conj(combining_vec)*a, axis=-1)
+            # Compute the amplitude of the path
+            # [num_hits]
+            a = tf.square(tf.abs(a))
 
         # Add the rays contribution to the coverage map
         # We just divide by cos(aoa) instead of dividing by the square distance
@@ -690,8 +763,19 @@ class SolverCoverageMap(SolverBase):
         # [num_hits]
         cos_aoa = tf.abs(dot(k_rx, cm_normal, clip=True))
 
-        # [num_hits]
-        ray_weights = tf.math.divide_no_nan(tf.ones_like(cos_aoa), cos_aoa)
+        if ris:
+            # Radii of curvature at the interaction point with the measurement
+            # plane
+            # [num_hits, 2]
+            radii_curv += tf.expand_dims(length, axis=1)
+            # [num_hits]
+            ray_weights = tf.math.divide_no_nan(radii_curv[:,0]*radii_curv[:,1],
+                                                cos_aoa)
+            ray_weights *= angular_opening
+        else:
+            # [num_hits]
+            ray_weights = tf.math.divide_no_nan(tf.ones_like(cos_aoa), cos_aoa)
+
         # Add the contribution to the coverage map
         # [num_hits, 3]
         hit_cells = tf.concat([tf.expand_dims(hit_mp_tx_ind, axis=-1),
@@ -702,7 +786,8 @@ class SolverCoverageMap(SolverBase):
         return cm
 
     def _compute_reflected_field(self, normals, etas, scattering_coefficient,
-                                 k_i, e_field, field_es, field_ep, scattering):
+            k_i, e_field, field_es, field_ep, scattering, ris, length,
+            radii_curv, dirs_curv):
         r"""
         Computes the reflected field at the intersections.
 
@@ -727,10 +812,22 @@ class SolverCoverageMap(SolverBase):
             Direction of the S component of the incident field
 
         field_ep : [num_active_samples, 3], tf.float
-            Directino of the P component of the incident field
+            Direction of the P component of the incident field
 
         scattering : bool
             Set to `True` if scattering is enabled
+
+        ris : bool
+            Set to `True` if RIS are enabled
+
+        length : [num_active_samples], tf.float
+            Length of the last path segment
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature
 
         Output
         -------
@@ -741,10 +838,16 @@ class SolverCoverageMap(SolverBase):
             Direction of the S component of the reflected field
 
         field_ep : [num_active_samples, 3], tf.float
-            Directino of the P component of the reflected field
+            Direction of the P component of the reflected field
 
         k_r : [num_active_samples, 3], tf.float
             Direction of the reflected ray
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature of the reflected ray tube
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature of the reflected ray tube
         """
 
         # [num_active_samples, 3]
@@ -812,11 +915,53 @@ class SolverCoverageMap(SolverBase):
         field_es = e_r_s
         field_ep = e_r_p
 
-        return e_field, field_es, field_ep, k_r
+        if ris:
+            # Compute and apply the spreading factor
+            # [num_active_samples]
+            sf = compute_spreading_factor(radii_curv[:,0], radii_curv[:,1],
+                                          length)
+            # [num_active_samples, 1, 1]
+            sf = expand_to_rank(sf, tf.rank(e_field), -1)
+            sf = tf.complex(sf, tf.zeros_like(sf))
+            # [num_active_samples, num_tx_patterns, 2]
+            e_field *= sf
+
+            # Update principal radii of curvature
+            # Radii of curvature at intersection point
+            # [num_reflected_samples, 2]
+            radii_curv += tf.expand_dims(length, axis=1)
+            # Radii of curvature of the reflected field
+            # [num_reflected_samples, 2]
+            inv_radii_curv = tf.math.reciprocal_no_nan(radii_curv)
+            # [num_reflected_samples]
+            inv_radii_curv_sum = inv_radii_curv[:,0] + inv_radii_curv[:,1]
+            # [num_reflected_samples]
+            inv_radii_curv_dif = tf.abs(inv_radii_curv[:,0]-inv_radii_curv[:,1])
+            # [num_reflected_samples, 2]
+            inv_new_radii_curv = tf.stack([
+                0.5*(inv_radii_curv_sum + inv_radii_curv_dif),
+                0.5*(inv_radii_curv_sum - inv_radii_curv_dif)], axis=1)
+            # [num_reflected_samples, 2]
+            new_radii_curv = tf.math.reciprocal_no_nan(inv_new_radii_curv)
+
+            # Update the principal direction of curvature
+            # [num_reflected_samples, 3]
+            new_dir_curv_1 = dirs_curv[:,0]\
+              - 2.*dot(dirs_curv[:,0], normals, keepdim=True, clip=True)*normals
+            # [num_reflected_samples, 3]
+            new_dir_curv_2 = -cross(k_r, new_dir_curv_1)
+            # [num_reflected_samples, 2, 3]
+            new_dirs_curv = tf.stack([new_dir_curv_1, new_dir_curv_2], axis=1)
+        else:
+            new_radii_curv = None
+            new_dirs_curv = None
+
+        return e_field, field_es, field_ep, k_r, new_radii_curv, new_dirs_curv
 
     def _compute_scattered_field(self, int_point, objects, normals, etas,
             scattering_coefficient, xpd_coefficient, alpha_r, alpha_i, lambda_,
-            k_i, e_field, field_es, field_ep, reflection):
+            k_i, e_field, field_es, field_ep, reflection, ris, length,
+            radii_curv, angular_opening):
         r"""
         Computes the scattered field at the intersections.
 
@@ -860,10 +1005,22 @@ class SolverCoverageMap(SolverBase):
             Direction of the S component of the incident field
 
         field_ep : [num_active_samples, 3], tf.float
-            Directins of the P component of the incident field
+            Direction of the P component of the incident field
 
         reflection : bool
             Set to `True` if reflection is enabled
+
+        ris : bool
+            Set to `True` if RIS is enabled
+
+        length : [num_active_samples], tf.float
+            Length of the last path segment
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening
 
         Output
         -------
@@ -878,9 +1035,29 @@ class SolverCoverageMap(SolverBase):
 
         k_s : [num_active_samples, 3], tf.float
             Direction of the scattered ray
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature of the scattered ray tube
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature of the scattered ray tube
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening of the scattered field
         """
 
-        # Represent incomning field in the basis for reflection
+        if ris:
+            # Compute and apply the spreading factor to the incident field
+            # [num_active_samples]
+            sf = compute_spreading_factor(radii_curv[:,0], radii_curv[:,1],
+                                          length)
+            # [num_active_samples, 1, 1]
+            sf = expand_to_rank(sf, tf.rank(e_field), -1)
+            sf = tf.complex(sf, tf.zeros_like(sf))
+            # [num_active_samples, num_tx_patterns, 2]
+            e_field *= sf
+
+        # Represent incident field in the basis for reflection
         e_i_s, e_i_p = compute_field_unit_vectors(k_i, None,
                                             normals, SolverBase.EPSILON,
                                             return_e_r=False)
@@ -946,7 +1123,8 @@ class SolverCoverageMap(SolverBase):
         num_active_samples = tf.shape(e_field)[0]
         phase_shape = [num_active_samples, 1, 2]
         # [num_active_samples, 1, 2]
-        phases = tf.random.uniform(phase_shape, maxval=2*PI, dtype=self._rdtype)
+        phases = config.tf_rng.uniform(phase_shape, maxval=2*PI,
+                                       dtype=self._rdtype)
 
         # Compute XPD weighting
         # [num_active_samples, 2]
@@ -997,7 +1175,17 @@ class SolverCoverageMap(SolverBase):
         e_field *= tf.complex(ref_amp, tf.zeros_like(ref_amp))
         f_s = tf.reshape(tf.sqrt(f_s), [-1, 1, 1])
         e_field *= tf.complex(f_s, tf.zeros_like(f_s))
-        e_field *= tf.cast(tf.sqrt(2*PI), self._dtype)
+
+        if ris:
+            # Weight due to angular domain
+            radii_curv += tf.expand_dims(length, axis=1)
+            # [num_active_samples, 1, 1]
+            w = angular_opening*radii_curv[:,0]*radii_curv[:,1]
+            w = expand_to_rank(w, tf.rank(e_field))
+            # [num_active_samples, num_tx_patterns, 2]
+            e_field *= tf.cast(tf.sqrt(w), self._dtype)
+        else:
+            e_field *= tf.cast(tf.sqrt(2*PI), self._dtype)
 
         # If reflection is enabled, then the rays are randomly
         # allocated to reflection or scattering by sampling according to the
@@ -1027,12 +1215,314 @@ class SolverCoverageMap(SolverBase):
 
         # Compute outgoing spherical unit vectors in GCS
         theta_s, phi_s = theta_phi_from_unit_vec(k_s)
-        # # [num_active_samples, 3]
+        # [num_active_samples, 3]
         field_es = theta_hat(theta_s, phi_s)
         field_ep = phi_hat(phi_s)
 
-        return e_field, field_es, field_ep, k_s
+        if ris:
+            # Update principal radii of curvature
+            # [num_reflected_samples, 2]
+            new_radii_curv = tf.zeros_like(radii_curv)
 
+            # Update the principal direction of curvature
+            # [num_reflected_samples, 3]
+            new_dir_curv_1, new_dir_curv_2 = gen_basis_from_z(k_s,
+                                                            SolverBase.EPSILON)
+            # [num_reflected_samples, 2, 3]
+            new_dirs_curv = tf.stack([new_dir_curv_1, new_dir_curv_2], axis=1)
+
+            # New angular opening
+            new_angular_opening = tf.fill(tf.shape(angular_opening),
+                                        tf.cast(2.*PI, self._rdtype))
+        else:
+            new_radii_curv = None
+            new_dirs_curv = None
+            new_angular_opening = None
+
+        return e_field, field_es, field_ep, k_s, new_radii_curv, new_dirs_curv,\
+            new_angular_opening
+
+    def _compute_ris_reflected_field(self, int_point, ris_ind, k_i, e_field,
+                            field_es, field_ep, length, radii_curv, dirs_curv):
+        r"""
+        Computes the field reflected by the RIS at the intersections.
+
+        Input
+        ------
+        int_point : [num_active_samples, 3], tf.float
+            Positions at which the rays intersect with the RIS
+
+        ris_ind : [num_active_samples], tf.int
+            Indices of the intersected RIS
+
+        k_i : [num_active_samples, 3], tf.float
+            Direction of arrival of the ray
+
+        e_field : [num_active_samples, num_tx_patterns, 2], tf.complex
+            S and P components of the incident field
+
+        field_es : [num_active_samples, 3], tf.float
+            Direction of the S component of the incident field
+
+        field_ep : [num_active_samples, 3], tf.float
+            Direction of the P component of the incident field
+
+        length : [num_active_samples], tf.float
+            Length of the last path segment
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature of the incident ray tube
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature of the incident ray tube
+
+        Output
+        -------
+        e_field : [num_active_samples, num_tx_patterns, 2], tf.complex
+            S and P components of the reflected field
+
+        field_es : [num_active_samples, 3], tf.float
+            Direction of the S component of the reflected field
+
+        field_ep : [num_active_samples, 3], tf.float
+            Direction of the P component of the reflected field
+
+        k_s : [num_active_samples, 3], tf.float
+            Direction of the reflected ray
+
+        normals : [num_active_samples, 3], tf.float
+            Normals to the intersected RIS
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature of the reflected ray tube
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature of the reflected ray tube
+        """
+        # Compute and apply the spreading factor
+        # [num_active_samples]
+        sf = compute_spreading_factor(radii_curv[:,0], radii_curv[:,1], length)
+        # [num_active_samples, 1, 1]
+        sf = expand_to_rank(sf, tf.rank(e_field), -1)
+        sf = tf.complex(sf, tf.zeros_like(sf))
+        # [num_active_samples, num_tx_patterns, 2]
+        e_field *= sf
+        # Update radii of curvature
+        # [num_active_samples, 2]
+        radii_curv += tf.expand_dims(length, axis=1)
+
+        all_int_point = int_point
+        all_k_i = k_i
+        all_e_field = e_field
+        all_field_es = field_es
+        all_field_ep = field_ep
+        all_radii_curv = radii_curv
+        all_dirs_curv = dirs_curv
+
+        # Outputs
+        output_e_field = tf.zeros([0, e_field.shape[1], 2], self._dtype)
+        output_field_es = tf.zeros([0, 3], self._rdtype)
+        output_field_ep = tf.zeros([0, 3], self._rdtype)
+        output_k_r = tf.zeros([0, 3], self._rdtype)
+        output_radii_curv = tf.zeros([0, 2], self._rdtype)
+        output_dirs_curv = tf.zeros([0, 2, 3], self._rdtype)
+        output_normals = tf.zeros([0, 3], self._rdtype)
+
+        # Iterate over the RIS
+        for ris in self._scene.ris.values():
+
+            # Get ID of this RIS
+            this_ris_id = ris.object_id
+
+            # Get normal of this RIS
+            # [3]
+            normal = ris.world_normal
+            # [1,3]
+            normal = tf.expand_dims(normal, axis=0)
+
+            # Indices of rays hitting this RIS
+            # [num_active_samples]
+            this_ris_sample_ind = tf.where(tf.equal(ris_ind, this_ris_id))[:,0]
+            num_active_samples = tf.shape(this_ris_sample_ind)[0]
+
+            # Gather incident ray directions for this RIS
+            # [num_active_samples, 3]
+            k_i = tf.gather(all_k_i, this_ris_sample_ind, axis=0)
+
+            # Boolean indicating the RIS side
+            # True means it's the front, False means it's the back.
+            # [num_active_samples]
+            hit_front = -tf.math.sign(dot(k_i, normal))
+            hit_front = tf.greater(hit_front, 0.0)
+
+            # Gather indices of rays that hit this RIS from the front
+            this_ris_sample_ind = tf.gather(this_ris_sample_ind,
+                                            tf.where(hit_front)[:,0])
+            # Number of samples corresponding to this RIS
+            num_ris_sample = tf.shape(this_ris_sample_ind)[0]
+
+            # Extract data relevant to this RIS
+            # [this_ris_num_samples, 3]
+            int_point = tf.gather(all_int_point, this_ris_sample_ind, axis=0)
+            # [this_ris_num_samples, 3]
+            k_i = tf.gather(all_k_i, this_ris_sample_ind, axis=0)
+            # [this_ris_num_samples, num_tx_patterns, 2]
+            e_field = tf.gather(all_e_field, this_ris_sample_ind, axis=0)
+            # [this_ris_num_samples, 3]
+            field_es = tf.gather(all_field_es, this_ris_sample_ind, axis=0)
+            # [this_ris_num_samples, 3]
+            field_ep = tf.gather(all_field_ep, this_ris_sample_ind, axis=0)
+            # [this_ris_num_samples, 2]
+            radii_curv = tf.gather(all_radii_curv, this_ris_sample_ind, axis=0)
+            # [this_ris_num_samples, 2, 3]
+            dirs_curv = tf.gather(all_dirs_curv, this_ris_sample_ind, axis=0)
+
+            # Number of rays hitting the RIS from the front
+            this_ris_num_samples = tf.shape(k_i)[0]
+
+            # Incidence phase gradient - Eq.(9)
+            # [this_ris_num_samples, 3]
+            grad_i = k_i-normal*dot(normal, k_i)[:,tf.newaxis]
+            grad_i *= -self._scene.wavenumber
+
+            # Transform interaction points to LCS of the corresponding RIS
+            # Store the rotation matrix for later
+            # [1, 3, 3]
+            rot_mat = rotation_matrix(ris.orientation)[tf.newaxis]
+            # [this_ris_num_samples, 3]
+            int_point_lcs = int_point - ris.position[tf.newaxis]
+            int_point_lcs = tf.linalg.matvec(rot_mat,
+                                            int_point_lcs,
+                                            transpose_a=True)
+
+            # As the LCS assumes x=0, we can remove the first dimension
+            # [this_ris_num_samples, 2]
+            int_point_lcs = int_point_lcs[:,1:]
+
+            # Compute spatial modulation coefficient for all reradiation modes
+            # gamma_m: [num_modes, this_ris_num_samples]
+            # grad_m: [num_modes, this_ris_num_samples, 3]
+            # hessian_m: [num_modes, this_ris_num_samples, 3, 3]
+            gamma_m, grad_m, hessian_m = ris(int_point_lcs, return_grads=True)
+            # Sample a single mode for each ray
+            # [this_ris_num_samples]
+            mode_powers = ris.amplitude_profile.mode_powers
+            mode = tf.random.categorical(logits=[tf.math.log(mode_powers)],
+                                 num_samples=this_ris_num_samples,
+                                 dtype=tf.int32)[0]
+            # gamma_m: [this_ris_num_samples]
+            # grad_m: [this_ris_num_samples, 3]
+            # hessian_m: [this_ris_num_samples, 3, 3]
+            gamma_m = tf.gather(tf.transpose(gamma_m, perm=[1,0]),
+                                mode, batch_dims=1)
+            grad_m = tf.gather(tf.transpose(grad_m, perm=[1, 0, 2]),
+                               mode, batch_dims=1)
+            hessian_m = tf.gather(tf.transpose(hessian_m, perm=[1, 0, 2, 3]),
+                                  mode, batch_dims=1)
+            # Bring RIS phase gradient to GCS
+            # [this_ris_num_samples, 3]
+            grad_m = tf.linalg.matvec(rot_mat, grad_m)
+
+            # Bring RIS phase Hessian to GCS
+            # [this_ris_num_samples, 3, 3]
+            hessian_m = tf.matmul(rot_mat,
+                                  tf.matmul(hessian_m,
+                                            rot_mat, transpose_b=True))
+
+
+            # Compute total phase gradient - Eq.(11)
+            # [this_ris_num_samples, 3]
+            grad = grad_i + grad_m
+
+            # Compute direction of reflected ray - Eq.(13)
+            # [this_ris_num_samples, 3]
+            k_r = -grad/self._scene.wavenumber
+            k_r += tf.sqrt(1 - tf.reduce_sum(k_r**2, axis=-1,
+                                             keepdims=True)) * normal
+            # Compute linear transformation operator - Eq.(22)
+            # [this_ris_num_samples, 3, 3]
+            l = -outer(k_r, normal)
+            l /= tf.reduce_sum(k_r*normal, axis=-1,
+                               keepdims=True)[...,tf.newaxis]
+            l += tf.eye(3, batch_shape=tf.shape(l)[:1], dtype=l.dtype)
+
+            # Compute incident curvature matrix - Eq.(4)
+            # [this_ris_num_samples, 3, 3]
+            q_i = 1/expand_to_rank(radii_curv[:,0], 3, -1) * \
+                   outer(dirs_curv[:,0], dirs_curv[:,0])
+            q_i += 1/expand_to_rank(radii_curv[:,1], 3, -1) * \
+                   outer(dirs_curv[:,1], dirs_curv[:,1])
+
+            # Compute reflected curvature matrix - Eq.(21)
+            # [this_ris_num_samples, 3, 3]
+            q_r = tf.matmul(q_i - 1/self._scene.wavenumber*hessian_m, l)
+            q_r = tf.matmul(l, q_r, transpose_a=True)
+
+            # Extract principal axes of curvature and associated radii - Eq.(4)
+            e, v,_ = tf.linalg.svd(q_r)
+            # [this_ris_num_samples, 2]
+            radii_curv = 1/e[:,:2]
+            # [this_ris_num_samples, 2, 3]
+            dirs_curv = tf.transpose(v[...,:2], perm=[0, 2, 1])
+
+            # Basis vectors for incoming field
+            # [this_ris_num_samples, 3]
+            theta_i, phi_i = theta_phi_from_unit_vec(k_i)
+            e_i_s = theta_hat(theta_i, phi_i)
+            e_i_p = phi_hat(phi_i)
+
+            # Component transform
+            # [this_ris_num_samples, 1, 2, 2]
+            mat_comp = component_transform(field_es, field_ep, e_i_s, e_i_p)
+            mat_comp = tf.complex(mat_comp, tf.zeros_like(mat_comp))
+            mat_comp = mat_comp[:,tf.newaxis]
+
+            # Outgoing field - Eq.(14)
+            # [this_ris_num_samples, num_tx_patterns, 2]
+            e_field = tf.linalg.matvec(mat_comp, e_field)
+            e_field *= expand_to_rank(gamma_m, 3, -1)
+
+            # Basis vectors for reflected field
+            # [this_ris_num_samples, 3]
+            theta_r, phi_r = theta_phi_from_unit_vec(k_r)
+            field_es = theta_hat(theta_r, phi_r)
+            field_ep = phi_hat(phi_r)
+
+            # Concatenate rays from reflection by all RIS
+            # and create all-zeros samples for the inactive rays
+            # which will be dropped in a later stage.
+            n_p = num_active_samples - this_ris_num_samples
+
+            def pad(x, n_p):
+                """Pad input tensor with n-p zero samples"""
+                paddings = tf.concat([[[0, n_p]],
+                                     tf.zeros([tf.rank(x)-1,2], tf.int32)],
+                                     axis=0)
+                return tf.pad(x, paddings)
+
+            output_e_field = tf.concat([output_e_field,
+                                        pad(e_field, n_p)],
+                                        axis=0)
+            output_field_es = tf.concat([output_field_es,
+                                         pad(field_es, n_p)],
+                                         axis=0)
+            output_field_ep = tf.concat([output_field_ep,
+                                         pad(field_ep, n_p)],
+                                         axis=0)
+            output_k_r = tf.concat([output_k_r, pad(k_r, n_p)], axis=0)
+            output_radii_curv = tf.concat([output_radii_curv,
+                                          pad(radii_curv, n_p)],
+                                          axis=0)
+            output_dirs_curv = tf.concat([output_dirs_curv,
+                                          pad(dirs_curv, n_p)],
+                                          axis=0)
+            normal = tf.tile(normal, [num_ris_sample, 1])
+            output_normals = tf.concat([output_normals,
+                                        pad(normal, n_p)], axis=0)
+
+        output = (output_e_field, output_field_es, output_field_ep, output_k_r,\
+            output_normals, output_radii_curv, output_dirs_curv)
+        return output
 
     def _init_e_field(self, valid_ray, samples_tx_indices, k_tx, tx_rot_mat):
         r"""
@@ -1065,7 +1555,6 @@ class SolverCoverageMap(SolverBase):
         """
 
         num_samples = tf.shape(valid_ray)[0]
-
         # [num_valid_samples]
         valid_ind = tf.where(valid_ray)[:,0]
         # [num_valid_samples]
@@ -1080,7 +1569,6 @@ class SolverCoverageMap(SolverBase):
         val_e_field, val_field_es, val_field_ep =\
             self._compute_antenna_patterns(tx_rot_mat,
                             self._scene.tx_array.antenna.patterns, k_tx)
-
         valid_ind = tf.expand_dims(valid_ind, axis=-1)
         # [num_samples, num_tx_patterns, 2]
         e_field = tf.scatter_nd(valid_ind, val_e_field,
@@ -1090,12 +1578,117 @@ class SolverCoverageMap(SolverBase):
                                  [num_samples, 3])
         field_ep = tf.scatter_nd(valid_ind, val_field_ep,
                                  [num_samples, 3])
-
         return e_field, field_es, field_ep
 
+    def _extract_active_ris_rays(self, active_ind, int_point,
+        previous_int_point, primitives, e_field, field_es, field_ep, radii_curv,
+        dirs_curv, angular_opening):
+        r"""
+        Extracts the active rays hitting a RIS.
+
+        Input
+        ------
+        active_ind : [num_active_samples], tf.int
+            Indices of the active rays
+
+        int_point : [num_samples, 3], tf.float
+            Positions at which the rays intersect with the scene. For the rays
+            that did not intersect the scene, the corresponding position should
+            be ignored.
+
+        previous_int_point : [num_samples, 3], tf.float
+            Positions of the previous intersection points of the rays with
+            the scene
+
+        primitives : [num_samples], tf.int
+            Indices of the intersected primitives
+
+        e_field : [num_samples, num_tx_patterns, 2], tf.complex
+            S and P components of the electric field
+
+        field_es : [num_samples, 3], tf.float
+            Direction of the S component of the field
+
+        field_ep : [num_samples, 3], tf.float
+            Direction of the P component of the field
+
+        radii_curv : [num_samples, 2], tf.float
+            Principal radii of curvature of the ray tubes
+
+        dirs_curv : [num_samples, 2, 3], tf.float
+            Principal directions of curvature of the ray tubes
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening
+
+        Output
+        -------
+        act_e_field : [num_active_samples, num_tx_patterns, 2], tf.complex
+            S and P components of the electric field of the active rays
+
+        act_field_es : [num_active_samples, 3], tf.float
+            Direction of the S component of the field of the active rays
+
+        act_field_ep : [num_active_samples, 3], tf.float
+            Direction of the P component of the field of the active rays
+
+        act_point : [num_active_samples, 3], tf.float
+            Positions at which the rays intersect with the scene
+
+        act_k_i : [num_active_samples, 3], tf.float
+            Direction of the active incident ray
+
+        act_dist : [num_active_samples], tf.float
+            Length of the last path segment, i.e., distance between `int_point`
+            and `previous_int_point`
+
+        act_radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature of the ray tubes
+
+        act_dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal directions of curvature of the ray tubes
+
+        act_angular_opening : [num_active_samples], tf.float
+            Angular opening
+        """
+
+        # Extract the rays that interact the scene
+        # [num_active_samples, num_tx_patterns, 2]
+        act_e_field = tf.gather(e_field, active_ind, axis=0)
+        # [num_active_samples, 3]
+        act_field_es = tf.gather(field_es, active_ind, axis=0)
+        # [num_active_samples, 3]
+        act_field_ep = tf.gather(field_ep, active_ind, axis=0)
+        # [num_active_samples, 2]
+        act_radii_curv = tf.gather(radii_curv, active_ind, axis=0)
+        # [num_active_samples, 2, 3]
+        act_dirs_curv = tf.gather(dirs_curv, active_ind, axis=0)
+        # [num_active_samples, 3]
+        act_previous_int_point = tf.gather(previous_int_point, active_ind,
+                                            axis=0)
+        # Current intersection point
+        # [num_active_samples, 3]
+        int_point = tf.gather(int_point, active_ind, axis=0)
+        # [num_active_samples]
+        act_primitives = tf.gather(primitives, active_ind, axis=0)
+
+        # Direction of arrival
+        # [num_active_samples, 3]
+        act_k_i,act_dist = normalize(int_point - act_previous_int_point)
+
+        # Extract angular openings
+        act_angular_opening = tf.gather(angular_opening, active_ind, axis=0)
+
+        output = (act_e_field, act_field_es, act_field_ep, int_point, act_k_i,
+                  act_dist, act_radii_curv, act_dirs_curv, act_primitives,
+                  act_angular_opening)
+
+        return output
+
     def _extract_active_rays(self, active_ind, int_point, previous_int_point,
-        primitives, e_field, field_es, field_ep, etas, scattering_coefficient,
-        xpd_coefficient, alpha_r, alpha_i, lambda_):
+        primitives, e_field, field_es, field_ep, samples_tx_indices, k_tx,
+        etas, scattering_coefficient, xpd_coefficient, alpha_r, alpha_i,
+        lambda_, ris, radii_curv, dirs_curv, angular_opening):
         r"""
         Extracts the active rays.
 
@@ -1125,10 +1718,16 @@ class SolverCoverageMap(SolverBase):
         field_ep : [num_samples, 3], tf.float
             Direction of the P component of the field
 
-        etas : [num_shape], tf.complex
+        samples_tx_indices : [num_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_samples, 3], tf.float
+            Direction of departure from the source
+
+        etas : [num_shape], tf.complex | `None`
             Tensor containing the complex relative permittivities of all shapes
 
-        scattering_coefficient : [num_shape], tf.float
+        scattering_coefficient : [num_shape], tf.float | `None`
             Tensor containing the scattering coefficients of all shapes
 
         xpd_coefficient : [num_shape], tf.float | `None`
@@ -1143,6 +1742,18 @@ class SolverCoverageMap(SolverBase):
 
         lambda_ : [num_shape], tf.float | `None`
             Tensor containing the lambda_ scattering parameters of all shapes
+
+        ris : bool
+            Set to `True` if RIS are enabled
+
+        radii_curv : [num_samples, 2], tf.float
+            Principal radii of curvature of the ray tubes
+
+        dirs_curv : [num_samples, 2, 3], tf.float
+            Principal directions of curvature of the ray tubes
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening
 
         Output
         -------
@@ -1190,6 +1801,28 @@ class SolverCoverageMap(SolverBase):
 
         act_objects : [num_active_samples], tf.int
             Indices of the intersected objects
+
+        act_dist : [num_active_samples], tf.float
+            Length of the last path segment, i.e., distance between `int_point`
+            and `previous_int_point`
+
+        samples_tx_indices : [num_active_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_active_samples, 3], tf.float
+            Direction of departure from the source
+
+        act_radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature of the ray tubes
+
+        act_dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal directions of curvature of the ray tubes
+
+        act_primitives : [num_active_samples], tf.int
+            Indices of the intersected primitives
+
+        act_angular_opening : [num_active_samples], tf.float
+            Angular opening
         """
 
         # Extract the rays that interact the scene
@@ -1199,6 +1832,14 @@ class SolverCoverageMap(SolverBase):
         act_field_es = tf.gather(field_es, active_ind, axis=0)
         # [num_active_samples, 3]
         act_field_ep = tf.gather(field_ep, active_ind, axis=0)
+        if ris:
+            # [num_active_samples, 2]
+            act_radii_curv = tf.gather(radii_curv, active_ind, axis=0)
+            # [num_active_samples, 2, 3]
+            act_dirs_curv = tf.gather(dirs_curv, active_ind, axis=0)
+        else:
+            act_radii_curv = None
+            act_dirs_curv = None
         # [num_active_samples, 3]
         act_previous_int_point = tf.gather(previous_int_point, active_ind,
                                             axis=0)
@@ -1210,27 +1851,43 @@ class SolverCoverageMap(SolverBase):
         # [num_active_samples]
         act_objects = tf.gather(self._primitives_2_objects, act_primitives,
                                 axis=0)
-        # Extract the normals to the intersected primitves
+        # [num_active_samples]
+        act_samples_tx_indices = tf.gather(samples_tx_indices, active_ind,
+                                           axis=0)
         # [num_active_samples, 3]
-        act_normals = tf.gather(self._normals, act_primitives, axis=0)
+        act_k_tx = tf.gather(k_tx, active_ind, axis=0)
+
+        # Extract the normals to the intersected primitives
+        # [num_active_samples, 3]
+        if self._normals.shape[0] > 0:
+            act_normals = tf.gather(self._normals, act_primitives, axis=0)
+        else:
+            act_normals = None
 
         # If a callable is defined to compute the radio material properties,
         # it is invoked. Otherwise, the radio materials of objects are used.
         rm_callable = self._scene.radio_material_callable
         if rm_callable is None:
             # Extract the material properties of the intersected objects
-            # [num_active_samples]
-            act_etas = tf.gather(etas, act_objects)
-            # [num_active_samples]
-            act_scat_coeff = tf.gather(scattering_coefficient, act_objects)
+            if etas is not None:
+                # [num_active_samples]
+                act_etas = tf.gather(etas, act_objects)
+            else:
+                act_etas = None
+            if scattering_coefficient is not None:
+                # [num_active_samples]
+                act_scat_coeff = tf.gather(scattering_coefficient, act_objects)
+            else:
+                act_scat_coeff = None
             if xpd_coefficient is not None:
+                # [num_active_samples]
                 act_xpd_coefficient = tf.gather(xpd_coefficient, act_objects)
             else:
                 act_xpd_coefficient = None
         else:
             # [num_active_samples]
-            act_etas, act_scat_coeff, act_xpd_coefficient = rm_callable(
-                act_objects, int_point)
+            act_etas, act_scat_coeff, act_xpd_coefficient\
+                                        = rm_callable(act_objects, int_point)
 
         # If no callable is defined for the scattering pattern, we need to
         # extract the properties of the scattering patterns built-in Sionna
@@ -1245,28 +1902,37 @@ class SolverCoverageMap(SolverBase):
 
         # Direction of arrival
         # [num_active_samples, 3]
-        act_k_i,_ = normalize(int_point - act_previous_int_point)
+        act_k_i,act_dist = normalize(int_point - act_previous_int_point)
 
         # Ensure the normal points in the direction -k_i
-        # [num_active_samples, 1]
-        flip_normal = -tf.math.sign(dot(act_k_i, act_normals, keepdim=True))
-        # [num_active_samples, 3]
-        act_normals = flip_normal*act_normals
+        if act_normals is not None:
+            # [num_active_samples, 1]
+            flip_normal = -tf.math.sign(dot(act_k_i, act_normals, keepdim=True))
+            # [num_active_samples, 3]
+            act_normals = flip_normal*act_normals
+
+        # Extract angular openings
+        if ris:
+            act_angular_opening = tf.gather(angular_opening, active_ind, axis=0)
+        else:
+            act_angular_opening = None
 
         output = (act_e_field, act_field_es, act_field_ep, int_point,
                 act_normals, act_etas, act_scat_coeff, act_k_i,
                 act_xpd_coefficient, act_alpha_r, act_alpha_i, act_lambda_,
-                act_objects)
+                act_objects, act_dist, act_samples_tx_indices, act_k_tx,
+                act_radii_curv, act_dirs_curv, act_primitives,
+                act_angular_opening)
 
         return output
 
     def _sample_interaction_phenomena(self, active, int_point, primitives,
                             scattering_coefficient, reflection, scattering):
         r"""
-        Samples the interaction phenoema to apply to each active ray, among
+        Samples the interaction phenomena to apply to each active ray, among
         scattering or reflection.
 
-        This is done by sampling a Bernouilli distribution with probablity p
+        This is done by sampling a Bernouilli distribution with probability p
         equal to the square of the scattering coefficient amplitude, as it
         corresponds to the ratio of the reflected energy that goes to
         scattering. With probability p, the ray is scattered. Otherwise, it is
@@ -1300,10 +1966,6 @@ class SolverCoverageMap(SolverBase):
             Indices of the rays that are scattered
         """
 
-        assert reflection or scattering,\
-            "This function should not be called if neither reflection nor"\
-                " scattering is enabled"
-
         # Indices of the active samples
         # [num_active_samples]
         active_ind = tf.where(active)[:,0]
@@ -1316,7 +1978,10 @@ class SolverCoverageMap(SolverBase):
         # reduction factor, depending on the selected phenomena.
         # This is done in the functions that compute the reflected and scattered
         # field.
-        if not reflection:
+        if not (reflection or scattering):
+            reflect_ind = tf.zeros([0], tf.int32)
+            scatter_ind = tf.zeros([0], tf.int32)
+        elif not reflection:
             reflect_ind = tf.zeros([0], tf.int32)
             scatter_ind = active_ind
         elif not scattering:
@@ -1348,10 +2013,10 @@ class SolverCoverageMap(SolverBase):
 
             # Sampling a Bernoulli distribution
             # [num_active_samples]
-            scatter = tf.random.uniform(tf.shape(prob_scatter),
-                                        tf.zeros((), self._rdtype),
-                                        tf.ones((), self._rdtype),
-                                        dtype=self._rdtype)
+            scatter = config.tf_rng.uniform(tf.shape(prob_scatter),
+                                            tf.zeros((), self._rdtype),
+                                            tf.ones((), self._rdtype),
+                                            dtype=self._rdtype)
             scatter = tf.less(scatter, prob_scatter)
 
             # Extract indices of the reflected and scattered rays
@@ -1363,8 +2028,9 @@ class SolverCoverageMap(SolverBase):
         return reflect_ind, scatter_ind
 
     def _apply_reflection(self, active_ind, int_point, previous_int_point,
-        primitives, e_field, field_es, field_ep, etas, scattering_coefficient,
-        scattering):
+        primitives, e_field, field_es, field_ep, samples_tx_indices, k_tx,
+        etas, scattering_coefficient, scattering, ris, radii_curv, dirs_curv,
+        angular_opening):
         r"""
         Apply reflection.
 
@@ -1391,6 +2057,12 @@ class SolverCoverageMap(SolverBase):
         field_ep : [num_samples, 3], tf.float
             Direction of the P component of the field
 
+        samples_tx_indices : [num_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_samples, 3], tf.float
+            Direction of departure from the source
+
         etas : [num_shape], tf.complex
             Complex relative permittivities of all shapes
 
@@ -1399,6 +2071,18 @@ class SolverCoverageMap(SolverBase):
 
         scattering : bool
             Set to `True` if scattering is enabled
+
+        ris : bool
+            Set to `True` if scattering is enabled
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening
 
         Output
         -------
@@ -1417,16 +2101,32 @@ class SolverCoverageMap(SolverBase):
         k_r : [num_reflected_samples, 3], tf.float
             Direction of the reflected ray
 
+        samples_tx_indices : [num_reflected_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_reflected_samples, 3], tf.float
+            Direction of departure from the source
+
         normals : [num_reflected_samples, 3], tf.float
             Normals at the intersection points
+
+        radii_curv : [num_reflected_samples, 2], tf.float
+            Principal radii of curvature of the reflected field
+
+        dirs_curv : [num_reflected_samples, 2, 3], tf.float
+            Principal direction of curvature of the reflected field
+
+        angular_opening : [num_reflected_samples], tf.float
+            Angular opening of the reflected ray
         """
 
         # Prepare field computation
         # This function extract the data for the rays to which reflection
-        # must be applied, and ensures that the normals are correcly oriented.
+        # must be applied, and ensures that the normals are correctly oriented.
         act_data = self._extract_active_rays(active_ind, int_point,
             previous_int_point, primitives, e_field, field_es, field_ep,
-            etas, scattering_coefficient, None, None, None, None)
+            samples_tx_indices, k_tx, etas, scattering_coefficient, None, None,
+            None, None, ris, radii_curv, dirs_curv, angular_opening)
         # [num_reflected_samples, num_tx_patterns, 2]
         e_field = act_data[0]
         # [num_reflected_samples, 3]
@@ -1440,17 +2140,37 @@ class SolverCoverageMap(SolverBase):
         act_scat_coeff = act_data[6]
         # [num_reflected_samples, 3]
         k_i = act_data[7]
+        # Length of the last path segment
+        # [num_reflected_samples]
+        length = act_data[13]
+        # Index of the intersected source
+        samples_tx_indices = act_data[14]
+        # Direction of departure form the source
+        k_tx = act_data[15]
+        if ris:
+            # Principal radii and directions of curvatures
+            # [num_reflected_samples, 2]
+            radii_curv = act_data[16]
+            # [num_reflected_samples, 2, 3]
+            dirs_curv = act_data[17]
+            # [num_reflected_samples]
+            angular_opening = act_data[18]
 
         # Compute the reflected field
-        e_field, field_es, field_ep, k_r = self._compute_reflected_field(
-            act_normals, act_etas, act_scat_coeff, k_i, e_field, field_es,
-            field_ep, scattering)
+        e_field, field_es, field_ep, k_r, radii_curv, dirs_curv\
+            = self._compute_reflected_field(act_normals,
+                act_etas, act_scat_coeff, k_i, e_field, field_es, field_ep,
+                scattering, ris, length, radii_curv, dirs_curv)
 
-        return e_field, field_es, field_ep, int_point, k_r, act_normals
+        output = (e_field, field_es, field_ep, int_point, k_r, act_normals,
+                  samples_tx_indices, k_tx, radii_curv, dirs_curv,
+                  angular_opening)
+        return output
 
     def _apply_scattering(self, active_ind, int_point, previous_int_point,
-        primitives, e_field, field_es, field_ep, etas, scattering_coefficient,
-        xpd_coefficient, alpha_r, alpha_i, lambda_, reflection):
+        primitives, e_field, field_es, field_ep,  samples_tx_indices, k_tx,
+        etas, scattering_coefficient, xpd_coefficient, alpha_r, alpha_i,
+        lambda_, reflection, ris, radii_curv, dirs_curv, angular_opening):
         r"""
         Apply scattering.
 
@@ -1477,6 +2197,12 @@ class SolverCoverageMap(SolverBase):
         field_ep : [num_samples, 3], tf.float
             Direction of the P component of the field
 
+        samples_tx_indices : [num_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_samples, 3], tf.float
+            Direction of departure from the source
+
         etas : [num_shape], tf.complex
             Complex relative permittivities of all shapes
 
@@ -1498,9 +2224,20 @@ class SolverCoverageMap(SolverBase):
         reflection : bool
             Set to `True` if reflection is enabled
 
+        ris : bool
+            Set to `True` if RIS is enabled
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening
+
         Output
         -------
-
         e_field : [num_scattered_samples, num_tx_patterns, 2], tf.complex
             S and P components of the scattered electric field
 
@@ -1516,8 +2253,23 @@ class SolverCoverageMap(SolverBase):
         k_r : [num_scattered_samples, 3], tf.float
             Direction of the scattered ray
 
+        samples_tx_indices : [num_scattered_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_scattered_samples, 3], tf.float
+            Direction of departure from the source
+
         normals : [num_scattered_samples, 3], tf.float
             Normals at the intersection points
+
+        radii_curv : [num_scattered_samples, 2], tf.float
+            Principal radii of curvature of the scattered field
+
+        dirs_curv : [num_scattered_samples, 2, 3], tf.float
+            Principal direction of curvature of the scattered field
+
+        angular_opening : [num_scattered_samples], tf.float
+            Angular opening of the scattered field
         """
 
         # Prepare field computation
@@ -1525,8 +2277,9 @@ class SolverCoverageMap(SolverBase):
         # must be applied, and ensures that the normals are correcly oriented.
         act_data = self._extract_active_rays(active_ind, int_point,
             previous_int_point, primitives, e_field, field_es, field_ep,
-            etas, scattering_coefficient, xpd_coefficient, alpha_r, alpha_i,
-            lambda_)
+            samples_tx_indices, k_tx, etas, scattering_coefficient,
+            xpd_coefficient, alpha_r, alpha_i, lambda_, ris, radii_curv,
+            dirs_curv, angular_opening)
         # [num_scattered_samples, num_tx_patterns, 2]
         e_field = act_data[0]
         # [num_scattered_samples, 3]
@@ -1546,17 +2299,159 @@ class SolverCoverageMap(SolverBase):
         act_alpha_i = act_data[10]
         act_lambda_ = act_data[11]
         act_objects = act_data[12]
+        # Length of the last path segment
+        # [num_scattered_samples]
+        length = act_data[13]
+        # Index of the intersected source
+        samples_tx_indices = act_data[14]
+        # Direction of departure form the source
+        k_tx = act_data[15]
+        if ris:
+            # Principal radii and directions of curvatures
+            # [num_scattered_samples, 2]
+            radii_curv = act_data[16]
+            # [num_scattered_samples, 2, 3]
+            dirs_curv = act_data[17]
+            # [num_scattered_samples]
+            angular_opening = act_data[18]
+
+        # Compute the scattered field
+        e_field, field_es, field_ep, k_r, radii_curv, dirs_curv,\
+            angular_opening = self._compute_scattered_field(int_point,
+                act_objects, act_normals, act_etas, act_scat_coeff,
+                act_xpd_coefficient, act_alpha_r, act_alpha_i, act_lambda_,
+                k_i, e_field, field_es, field_ep, reflection, ris, length,
+                radii_curv, angular_opening)
+
+        output = (e_field, field_es, field_ep, int_point, k_r, act_normals,
+                  samples_tx_indices, k_tx,  radii_curv, dirs_curv,
+                  angular_opening)
+        return output
+
+    def _apply_ris_reflection(self, active_ind, int_point, previous_int_point,
+        primitives, e_field, field_es, field_ep, samples_tx_indices, k_tx,
+        radii_curv, dirs_curv, angular_opening):
+        r"""
+        Apply scattering.
+
+        Input
+        ------
+        active_ind : [num_ris_reflected_samples], tf.int
+            Indices of the *active* rays to which scattering must be applied.
+
+        int_point : [num_samples, 3], tf.float
+            Locations of the intersection point
+
+        previous_int_point : [num_samples, 3], tf.float
+            Locations of the intersection points of the previous interaction.
+
+        primitives : [num_samples], tf.int
+            Indices of the intersected primitives
+
+        e_field : [num_samples, num_tx_patterns, 2], tf.complex
+            S and P components of the electric field
+
+        field_es : [num_samples, 3], tf.float
+            Direction of the S component of the field
+
+        field_ep : [num_samples, 3], tf.float
+            Direction of the P component of the field
+
+        samples_tx_indices : [num_samples], tf.int
+            Index of the source from which the path originates
+
+        k_tx : [num_samples, 3], tf.float
+            Direction of departure from the source
+
+        radii_curv : [num_active_samples, 2], tf.float
+            Principal radii of curvature
+
+        dirs_curv : [num_active_samples, 2, 3], tf.float
+            Principal direction of curvature
+
+        angular_opening : [num_active_samples], tf.float
+            Angular opening
+
+        Output
+        -------
+        e_field : [num_ris_reflected_samples, num_tx_patterns, 2], tf.complex
+            S and P components of the reflected electric field
+
+        field_es : [num_ris_reflected_samples, 3], tf.float
+            Direction of the S component of the reflected field
+
+        field_ep : [num_ris_reflected_samples, 3], tf.float
+            Direction of the P component of the reflected field
+
+        int_point : [num_ris_reflected_samples, 3], tf.float
+            Locations of the intersection point
+
+        k_r : [num_ris_reflected_samples, 3], tf.float
+            Direction of the reflected ray
+
+        samples_tx_indices : [num_ris_reflected_samples], tf.int
+            Index of the intersected transmitter
+
+        k_tx : [num_ris_reflected_samples, 3], tf.float
+            Direction of departure from the source
+
+        normals : [num_ris_reflected_samples, 3], tf.float
+            Normals at the intersection points
+
+        radii_curv : [num_ris_reflected_samples, 2], tf.float
+            Principal radii of curvature of the reflected field
+
+        dirs_curv : [num_ris_reflected_samples, 2, 3], tf.float
+            Principal direction of curvature of the reflected field
+
+        angular_opening : [num_ris_reflected_samples], tf.float
+            Angular opening of the reflected field
+        """
+        # Prepare field computation
+        # This function extract the data for the rays to which scattering
+        # must be applied, and ensures that the normals are correctly oriented.
+        act_data = self._extract_active_ris_rays(active_ind, int_point,
+            previous_int_point, primitives, e_field, field_es, field_ep,
+            samples_tx_indices, k_tx, radii_curv, dirs_curv, angular_opening)
+        # [num_ris_reflected_samples, num_tx_patterns, 2]
+        e_field = act_data[0]
+        # [num_ris_reflected_samples, 3]
+        field_es = act_data[1]
+        field_ep = act_data[2]
+        int_point = act_data[3]
+        # [num_ris_reflected_samples, 3]
+        k_i = act_data[4]
+        # Length of the last path segment
+        # [num_ris_reflected_samples]
+        length = act_data[5]
+        # Principal radii and directions of curvatures
+        # [num_ris_reflected_samples, 2]
+        radii_curv = act_data[6]
+        # [num_ris_reflected_samples, 2, 3]
+        dirs_curv = act_data[7]
+        # [num_ris_reflected_samples]
+        ris_ind = act_data[8]
+        # [num_ris_reflected_samples]
+        angular_opening = act_data[9]
+        # Index of the intersected source
+        samples_tx_indices = act_data[14]
+        # Direction of departure form the source
+        k_tx = act_data[15]
 
         # Compute the reflected field
-        e_field, field_es, field_ep, k_r = self._compute_scattered_field(
-            int_point, act_objects, act_normals, act_etas, act_scat_coeff,
-            act_xpd_coefficient, act_alpha_r, act_alpha_i, act_lambda_, k_i,
-            e_field, field_es, field_ep, reflection)
+        e_field, field_es, field_ep, k_r, normals, radii_curv, dirs_curv,\
+            = self._compute_ris_reflected_field(int_point, ris_ind, k_i,
+                e_field, field_es, field_ep, length, radii_curv, dirs_curv)
 
-        return e_field, field_es, field_ep, int_point, k_r, act_normals
+        output = (e_field, field_es, field_ep, int_point, k_r, normals,
+                  samples_tx_indices, k_tx, radii_curv, dirs_curv,
+                  angular_opening)
+        return output
 
     def _shoot_and_bounce(self,
                           meas_plane,
+                          ris_objects,
+                          ris_indices,
                           rx_orientation,
                           sources_positions,
                           sources_orientations,
@@ -1569,12 +2464,14 @@ class SolverCoverageMap(SolverBase):
                           reflection,
                           diffraction,
                           scattering,
+                          ris,
                           etas,
                           scattering_coefficient,
                           xpd_coefficient,
                           alpha_r,
                           alpha_i,
-                          lambda_):
+                          lambda_,
+                          random_lattice):
         r"""
         Runs shoot-and-bounce to build the coverage map for LoS, reflection,
         and scattering.
@@ -1586,6 +2483,12 @@ class SolverCoverageMap(SolverBase):
         ------
         meas_plane : mi.Shape
             Mitsuba rectangle defining the measurement plane
+
+        ris_objects : list(mi.Rectangle)
+            List of Mitsuba rectangles implementing the RIS
+
+        ris_indices : mi.UInt
+            RIS indices
 
         rx_orientation : [3], tf.float
             Orientation of the receiver.
@@ -1603,8 +2506,8 @@ class SolverCoverageMap(SolverBase):
 
         combining_vec : [num_rx_ant], tf.complex
             Combining vector.
-            This is used to combine the signal from the receive antennas for
-            an imaginary receiver located on the coverage map.
+            If set to `None`, then no combining is applied, and
+            the energy received by all antennas is summed.
 
         precoding_vec : [num_tx or 1, num_tx_ant], tf.complex
             Precoding vectors of the transmitters
@@ -1637,6 +2540,9 @@ class SolverCoverageMap(SolverBase):
         scattering : bool
             If set to `True`, then the scattered paths are computed.
 
+        ris : bool
+            If set to `True`, then paths involving RIS are computed.
+
         etas : [num_shape], tf.complex
             Tensor containing the complex relative permittivities of all shapes
 
@@ -1656,6 +2562,10 @@ class SolverCoverageMap(SolverBase):
         lambda_ : [num_shape], tf.float
             Tensor containing the lambda_ scattering parameters of all shapes
 
+        random_lattice : bool
+            If set to `True`, a random rotation is applied to the Fibonacci
+            lattice
+
         Output
         ------
         cm : [num_tx, num_cells_y, num_cells_x], tf.float
@@ -1666,6 +2576,8 @@ class SolverCoverageMap(SolverBase):
             Primitives in LoS.
             `None` is returned if ``diffraction`` is set to `False`.
         """
+
+        ris = ris and (len(self._scene.ris) > 0)
 
         # Ensure that sample count can be distributed over the emitters
         num_tx = sources_positions.shape[0]
@@ -1704,9 +2616,19 @@ class SolverCoverageMap(SolverBase):
         # Direction arranged in a Fibonacci lattice on the unit
         # sphere.
         # [num_samples, 3]
-        k_tx = fibonacci_lattice(samples_per_tx, self._rdtype)
-        k_tx = tf.tile(k_tx, [num_tx, 1])
-        k_tx_dr = self._mi_vec_t(k_tx)
+        ps = fibonacci_lattice(samples_per_tx, self._rdtype)
+        ps_dr = self._mi_point2_t(ps)
+        ps_dr = dr.tile(ps_dr, num_tx)
+        k_tx_dr = mi.warp.square_to_uniform_sphere(ps_dr)
+        if random_lattice:
+            # Generate a random 3D rotation and apply it to the rays directions
+            angles = config.tf_rng.uniform([3],
+                                     minval=tf.cast(0.0, self._rdtype),
+                                     maxval=tf.cast(PI, self._rdtype),
+                                     dtype=self._rdtype)
+            rnd_rotation = angles_to_mitsuba_rotation(angles)
+            k_tx_dr = rnd_rotation@k_tx_dr
+        k_tx = mi_to_tf_tensor(k_tx_dr, self._rdtype)
         # Origin placed on the given transmitters
         # [num_samples]
         samples_tx_indices_dr = dr.linspace(self._mi_scalar_t, 0, num_tx-1e-7,
@@ -1731,6 +2653,41 @@ class SolverCoverageMap(SolverBase):
         # [num_tx, num_cells_y+1, num_cells_x+1]
         cm = tf.zeros([num_tx, num_cells_y+1, num_cells_x+1],dtype=self._rdtype)
 
+        if ris:
+            # Radii of curvatures are initialized to 0
+            # [num_samples, 2]
+            radii_curv = tf.zeros([num_samples, 2], dtype=self._rdtype)
+            # Principal directions of curvatures are represented in the GCS.
+            # Waves radiated by the transmitter are spherical, and therefore any
+            # vectors u,v such that (u,v,k) is an orthonormal basis and where k
+            # is the direction of propagation are principal directions of
+            # curvature.
+            # [num_samples, 3]
+            dir_curv_1, dir_curv_2 = gen_basis_from_z(k_tx, SolverBase.EPSILON)
+            dirs_curv = tf.stack([dir_curv_1, dir_curv_2], axis=1)
+            # Angular opening of the ray tube
+            # [num_samples]
+            angular_opening = tf.fill([num_samples],
+                                tf.cast(4.*PI/samples_per_tx_float,
+                                        self._rdtype))
+        else:
+            # The following quantities are not used if RIS are disabled
+            radii_curv = None
+            dirs_curv = None
+            angular_opening = None
+
+        # Offset to apply to the Mitsuba shape modeling RIS to get the
+        # corresponding objects ids
+        if len(self._scene.objects)>0:
+            ris_ind_offset = max(obj.object_id for obj in
+                                 self._scene.objects.values())
+        else:
+            ris_ind_offset = 0
+        # Because Mitsuba does not necessarily assign IDs starting from 1,
+        # we need to account for this offset
+        ris_mi_ids = mi_to_tf_tensor(ris_indices, tf.int32)
+        ris_ind_offset -= (tf.reduce_min(ris_mi_ids).numpy() - 1)
+
         for depth in tf.range(max_depth+1):
 
             ################################################
@@ -1743,19 +2700,36 @@ class SolverCoverageMap(SolverBase):
             # Intersect with the measurement plane
             si_mp = meas_plane.ray_intersect(ray)
 
+            # Intersect with RIS
+            # It is required to split the kernel as intersections are
+            # tested with another Mitsuba scene containing the RIS
+            if ris:
+                si_ris_val, si_ris_t, ris_ind = self._ris_intersect(ris_objects,
+                                                                    ray, True)
+            else:
+                si_ris_t = float("inf")
+                si_ris_val = False
+
+            hit_scene_dr = si_scene.is_valid() & (si_scene.t < si_ris_t)
+            hit_ris_dr = si_ris_val & (si_ris_t <= si_scene.t)
+
+            # A ray is active if it interacted with the scene or a RIS
+            # [num_samples]
+            active_dr = hit_scene_dr | hit_ris_dr
+            # [num_samples]
+            hit_scene = mi_to_tf_tensor(hit_scene_dr, tf.bool)
+            hit_ris = mi_to_tf_tensor(hit_ris_dr, tf.bool)
+            active = mi_to_tf_tensor(active_dr, tf.bool)
+
             # Hit the measurement plane?
             # An intersection with the coverage map is only valid if it was
             # not obstructed
             # [num_samples]
-            hit_mp_dr = (si_mp.t < si_scene.t) & si_mp.is_valid()
+            hit_mp_dr =  si_mp.is_valid()\
+                        & (si_mp.t < si_scene.t)\
+                        & (si_mp.t < si_ris_t)
             # [num_samples]
             hit_mp = mi_to_tf_tensor(hit_mp_dr, tf.bool)
-
-            # A ray is active if it interacted with the scene
-            # [num_samples]
-            active_dr = si_scene.is_valid()
-            # [num_samples]
-            active = mi_to_tf_tensor(active_dr, tf.bool)
 
             # Discard LoS if requested
             # [num_samples]
@@ -1777,7 +2751,6 @@ class SolverCoverageMap(SolverBase):
             ################################################
             # Update the coverage map
             ################################################
-
             # Intersection point with the measurement plane
             # [num_samples, 3]
             mp_hit_point = ray.o + si_mp.t*ray.d
@@ -1787,7 +2760,7 @@ class SolverCoverageMap(SolverBase):
                 cm_cell_size, num_cells, rot_gcs_2_mp, cm_normal, tx_rot_mat,
                 rx_rot_mat, precoding_vec, combining_vec, samples_tx_indices,
                 e_field, field_es, field_ep, mp_hit_point, hit_mp, k_tx,
-                previous_int_point, cm)
+                previous_int_point, cm, ris, radii_curv, angular_opening)
 
             # If the maximum requested depth is reached, we stop, as we just
             # updated the coverage map with the last requested contribution from
@@ -1797,20 +2770,31 @@ class SolverCoverageMap(SolverBase):
                 break
 
             #############################################
-            # Extract primitives that were hit by
+            # Extract primitives and RIS that were hit by
             # active rays.
             #############################################
 
-            # Extract the primitives that were hit
-            # Primitives that were hit
-            shape_i = dr.gather(mi.Int32, self._shape_indices,
-                                dr.reinterpret_array_v(mi.UInt32,
-                                                       si_scene.shape),
-                                active_dr)
-            offsets = dr.gather(mi.Int32, self._prim_offsets, shape_i,
-                                active_dr)
+            # Extract the scene primitives that were hit
+            if dr.shape(self._shape_indices)[0] > 0: # Scene is not empty
+                shape_i = dr.gather(mi.Int32, self._shape_indices,
+                            dr.reinterpret_array_v(mi.UInt32, si_scene.shape),
+                            hit_scene_dr)
+                offsets = dr.gather(mi.Int32, self._prim_offsets, shape_i,
+                                    hit_scene_dr)
+                scene_primitives = offsets + si_scene.prim_index
+            else: # Scene is empty
+                scene_primitives = dr.zeros(mi.Int32, dr.shape(hit_scene_dr)[0])
+
+            # Extract indices of RIS that were hit
+            if ris:
+                ris_ind = ris_ind + ris_ind_offset
+            else:
+                ris_ind = dr.zeros(mi.Int32, dr.shape(hit_scene_dr)[0])
+
+            # Combine into a single array
             # [num_samples]
-            primitives = dr.select(active_dr, offsets + si_scene.prim_index, -1)
+            primitives = dr.select(hit_scene_dr, scene_primitives, ris_ind)
+            primitives = dr.select(active_dr, primitives, -1)
             primitives = mi_to_tf_tensor(primitives, tf.int32)
 
             # If diffraction is enabled, stores the primitives in LoS
@@ -1818,12 +2802,14 @@ class SolverCoverageMap(SolverBase):
             # coverage map for diffraction (not in this function).
             if diffraction and (depth == 0):
                 # [num_samples]
-                los_primitives = primitives
+                los_primitives = dr.select(hit_scene_dr, scene_primitives, -1)
+                los_primitives = mi_to_tf_tensor(los_primitives, tf.int32)
 
             # At this point, max_depth > 0 and there are still active rays.
-            # However, we can stop if neither reflection or scattering is
-            # enabled, as only these phenomena require to go further.
-            if not (reflection or scattering):
+            # However, we can stop if neither reflection, scattering or
+            # reflection from RIS is enabled, as only these phenomena require to
+            # go further.
+            if not (reflection or scattering or ris):
                 break
 
             #############################################
@@ -1833,7 +2819,9 @@ class SolverCoverageMap(SolverBase):
 
             # Intersection point
             # [num_samples, 3]
-            int_point = ray.o + si_scene.t*ray.d
+            int_point = dr.select(hit_scene_dr,
+                                  ray.o + si_scene.t*ray.d,
+                                  ray.o + si_ris_t*ray.d)
             int_point = mi_to_tf_tensor(int_point, self._rdtype)
 
             # Sample scattering/reflection phenomena.
@@ -1842,15 +2830,25 @@ class SolverCoverageMap(SolverBase):
             #  scatter_ind : [num_scattered_samples]
             #   Indices of the rays that are scattered
             reflect_ind, scatter_ind = self._sample_interaction_phenomena(
-                                active, int_point, primitives,
-                                scattering_coefficient, reflection, scattering)
+                                hit_scene, int_point, primitives,
+                                scattering_coefficient, reflection,
+                                scattering)
 
+            # Indices of the rays that hit RIS
+            # [num_ris_reflected_samples]
+            ris_reflect_ind = tf.where(hit_ris)[:,0]
             updated_e_field = tf.zeros([0, e_field.shape[1], 2], self._dtype)
             updated_field_es = tf.zeros([0, 3], self._rdtype)
             updated_field_ep = tf.zeros([0, 3], self._rdtype)
             updated_int_point = tf.zeros([0, 3], self._rdtype)
             updated_k_r = tf.zeros([0, 3], self._rdtype)
             normals = tf.zeros([0, 3], self._rdtype)
+            updated_samples_tx_indices = tf.zeros([0], tf.int32)
+            updated_k_tx = tf.zeros([0, 3], self._rdtype)
+            if ris:
+                updated_radii_curv = tf.zeros([0, 2], self._rdtype)
+                updated_dirs_curv = tf.zeros([0, 2, 3], self._rdtype)
+                updated_ang_opening = tf.zeros([0], self._rdtype)
 
             if tf.shape(reflect_ind)[0] > 0:
                 # ref_e_field : [num_reflected_samples, num_tx_patterns, 2]
@@ -1858,10 +2856,20 @@ class SolverCoverageMap(SolverBase):
                 # ref_field_ep : [num_reflected_samples, 3]
                 # ref_int_point : [num_reflected_samples, 3]
                 # ref_k_r : [num_reflected_samples, 3]
-                ref_e_field, ref_field_es, ref_field_ep, ref_int_point,ref_k_r,\
-                    ref_n = self._apply_reflection(reflect_ind, int_point,
-                        previous_int_point, primitives, e_field, field_es,
-                        field_ep, etas, scattering_coefficient, scattering)
+                # ref_n : [num_reflected_samples, 3]
+                # ref_radii_curv : [num_reflected_samples, 2]
+                # ref_dirs_curv : [num_reflected_samples, 2, 3]
+                # ref_ang_opening : [num_reflected_samples]
+                # ref_samples_tx_indices : [num_reflected_samples]
+                # ref_k_tx : [num_reflected_samples, 3]
+                ref_e_field, ref_field_es, ref_field_ep, ref_int_point,\
+                    ref_k_r, ref_n, ref_samples_tx_indices, ref_k_tx,\
+                    ref_radii_curv, ref_dirs_curv, ref_ang_opening\
+                        = self._apply_reflection(reflect_ind,
+                        int_point, previous_int_point, primitives, e_field,
+                        field_es, field_ep, samples_tx_indices, k_tx,
+                        etas, scattering_coefficient, scattering, ris,
+                        radii_curv, dirs_curv, angular_opening)
 
                 updated_e_field = tf.concat([updated_e_field, ref_e_field],
                                             axis=0)
@@ -1873,18 +2881,39 @@ class SolverCoverageMap(SolverBase):
                                                 axis=0)
                 updated_k_r = tf.concat([updated_k_r, ref_k_r], axis=0)
                 normals = tf.concat([normals, ref_n], axis=0)
+                updated_samples_tx_indices =\
+                    tf.concat([updated_samples_tx_indices,
+                               ref_samples_tx_indices], axis=0)
+                updated_k_tx = tf.concat([updated_k_tx, ref_k_tx], axis=0)
+                if ris:
+                    updated_radii_curv = tf.concat([updated_radii_curv,
+                                                    ref_radii_curv], axis=0)
+                    updated_dirs_curv = tf.concat([updated_dirs_curv,
+                                                ref_dirs_curv], axis=0)
+                    updated_ang_opening = tf.concat([updated_ang_opening,
+                                                    ref_ang_opening], axis=0)
 
             if tf.shape(scatter_ind)[0] > 0:
-                # scat_e_field : [num_reflected_samples, num_tx_patterns, 2]
-                # scat_field_es : [num_reflected_samples, 3]
-                # scat_field_ep : [num_reflected_samples, 3]
-                # scat_int_point : [num_reflected_samples, 3]
-                # scat_k_r : [num_reflected_samples, 3]
+                # scat_e_field : [num_scattered_samples, num_tx_patterns, 2]
+                # scat_field_es : [num_scattered_samples, 3]
+                # scat_field_ep : [num_scattered_samples, 3]
+                # scat_int_point : [num_scattered_samples, 3]
+                # scat_k_r : [num_scattered_samples, 3]
+                # scat_n : [num_scattered_samples, 3]
+                # scat_radii_curv : [num_scattered_samples, 2]
+                # scat_dirs_curv : [num_scattered_samples, 2, 3]
+                # scat_ang_opening : [num_scattered_samples]
+                # scat_samples_tx_indices : [num_scattered_samples]
+                # scat_k_tx : [num_scattered_samples, 3]
                 scat_e_field, scat_field_es, scat_field_ep, scat_int_point,\
-                    scat_k_r, scat_n = self._apply_scattering(scatter_ind,
+                    scat_k_r, scat_n, scat_samples_tx_indices, scat_k_tx,\
+                    scat_radii_curv, scat_dirs_curv, scat_ang_opening\
+                        = self._apply_scattering(scatter_ind,
                         int_point, previous_int_point, primitives, e_field,
-                        field_es, field_ep, etas, scattering_coefficient,
-                        xpd_coefficient, alpha_r, alpha_i, lambda_, reflection)
+                        field_es, field_ep, samples_tx_indices, k_tx,
+                        etas, scattering_coefficient, xpd_coefficient, alpha_r,
+                        alpha_i, lambda_, reflection, ris, radii_curv,
+                        dirs_curv, angular_opening)
 
                 updated_e_field = tf.concat([updated_e_field, scat_e_field],
                                             axis=0)
@@ -1896,16 +2925,95 @@ class SolverCoverageMap(SolverBase):
                                                 scat_int_point], axis=0)
                 updated_k_r = tf.concat([updated_k_r, scat_k_r], axis=0)
                 normals = tf.concat([normals, scat_n], axis=0)
+                updated_samples_tx_indices =\
+                    tf.concat([updated_samples_tx_indices,
+                               scat_samples_tx_indices], axis=0)
+                updated_k_tx = tf.concat([updated_k_tx, scat_k_tx], axis=0)
+                if ris:
+                    updated_radii_curv = tf.concat([updated_radii_curv,
+                                                    scat_radii_curv], axis=0)
+                    updated_dirs_curv = tf.concat([updated_dirs_curv,
+                                                scat_dirs_curv], axis=0)
+                    updated_ang_opening = tf.concat([updated_ang_opening,
+                                                    scat_ang_opening], axis=0)
 
+            if tf.shape(ris_reflect_ind)[0] > 0:
+                # ris_e_field : [num_ris_reflected_samples, num_tx_patterns, 2]
+                # ris_field_es : [num_ris_reflected_samples, 3]
+                # ris_field_ep : [num_ris_reflected_samples, 3]
+                # ris_int_point : [num_ris_reflected_samples, 3]
+                # ris_k_r : [num_ris_reflected_samples, 3]
+                # ris_n : [num_ris_reflected_samples, 3]
+                # ris_radii_curv : [num_ris_reflected_samples, 2]
+                # ris_dirs_curv : [num_ris_reflected_samples, 2, 3]
+                # ris_ang_opening : [num_ris_reflected_samples]
+                # ris_samples_tx_indices : [num_ris_reflected_samples]
+                # ris_k_tx : [num_ris_reflected_samples, 3]
+                ris_e_field, ris_field_es, ris_field_ep, ris_int_point,\
+                 ris_k_r, ris_n, ris_samples_tx_indices, ris_k_tx,\
+                 ris_radii_curv, ris_dirs_curv, ris_ang_opening\
+                     = self._apply_ris_reflection(ris_reflect_ind,
+                        int_point, previous_int_point, primitives, e_field,
+                        field_es, field_ep, samples_tx_indices, k_tx,
+                        radii_curv, dirs_curv, angular_opening)
+                updated_e_field = tf.concat([updated_e_field, ris_e_field],
+                                            axis=0)
+                updated_field_es = tf.concat([updated_field_es, ris_field_es],
+                                                axis=0)
+                updated_field_ep = tf.concat([updated_field_ep, ris_field_ep],
+                                                axis=0)
+                updated_int_point = tf.concat([updated_int_point,
+                                                ris_int_point], axis=0)
+                updated_k_r = tf.concat([updated_k_r, ris_k_r], axis=0)
+                normals = tf.concat([normals, ris_n], axis=0)
+                updated_radii_curv = tf.concat([updated_radii_curv,
+                                                ris_radii_curv], axis=0)
+                updated_dirs_curv = tf.concat([updated_dirs_curv,
+                                            ris_dirs_curv], axis=0)
+                updated_ang_opening = tf.concat([updated_ang_opening,
+                                                ris_ang_opening], axis=0)
+                updated_samples_tx_indices =\
+                        tf.concat([updated_samples_tx_indices,
+                                ris_samples_tx_indices], axis=0)
+                updated_k_tx = tf.concat([updated_k_tx, ris_k_tx], axis=0)
 
             e_field = updated_e_field
             field_es = updated_field_es
             field_ep = updated_field_ep
             k_r = updated_k_r
             int_point = updated_int_point
-            # Only keep TX indices for active rays
+            samples_tx_indices = updated_samples_tx_indices
+            k_tx = updated_k_tx
+            if ris:
+                radii_curv = updated_radii_curv
+                dirs_curv = updated_dirs_curv
+                angular_opening = updated_ang_opening
+
+            ###############################################
+            # Discard paths which path loss is below a
+            # threshold
+            ###############################################
+            # [num_samples]
+            e_field_en = tf.reduce_sum(tf.square(tf.abs(e_field)), axis=(1,2))
+            active = tf.greater(e_field_en, SolverCoverageMap.DISCARD_THRES)
+            if not tf.reduce_any(active):
+                break
             # [num_active_samples]
-            samples_tx_indices = tf.boolean_mask(samples_tx_indices, active)
+            active_ind = tf.where(active)[:,0]
+            # [num_active_samples, ...]
+            e_field = tf.gather(e_field, active_ind, axis=0)
+            field_es = tf.gather(field_es, active_ind, axis=0)
+            field_ep = tf.gather(field_ep, active_ind, axis=0)
+            k_r = tf.gather(k_r, active_ind, axis=0)
+            int_point = tf.gather(int_point, active_ind, axis=0)
+            normals = tf.gather(normals, active_ind, axis=0)
+            samples_tx_indices = tf.gather(samples_tx_indices, active_ind,
+                                           axis=0)
+            k_tx = tf.gather(k_tx, active_ind, axis=0)
+            if ris:
+                radii_curv = tf.gather(radii_curv, active_ind, axis=0)
+                dirs_curv = tf.gather(dirs_curv, active_ind, axis=0)
+                angular_opening = tf.gather(angular_opening, active_ind, axis=0)
 
             ###############################################
             # Reflect or scatter the current ray
@@ -1928,8 +3036,11 @@ class SolverCoverageMap(SolverBase):
 
         # Scaling factor
         cell_area = cm_cell_size[0]*cm_cell_size[1]
-        cst = tf.cast(4.*PI*cell_area*samples_per_tx_float, self._rdtype)
-        cm_scaling = tf.square(self._scene.wavelength)/cst
+        if ris:
+            cm_scaling = tf.square(self._scene.wavelength/(4.*PI))/cell_area
+        else:
+            cst = tf.cast(4.*PI*cell_area*samples_per_tx_float, self._rdtype)
+            cm_scaling = tf.square(self._scene.wavelength)/cst
         cm_scaling = tf.cast(cm_scaling, self._rdtype)
 
         # Dump the dummy line and row and apply the scaling factor
@@ -2249,10 +3360,10 @@ class SolverCoverageMap(SolverBase):
 
         # Uniformly sample angles for shooting rays on the diffraction cone
         # [num_samples]
-        phis = tf.random.uniform([num_samples],
-                                 minval=tf.zeros_like(wedges_angle),
-                                 maxval=wedges_angle,
-                                 dtype=self._rdtype)
+        phis = config.tf_rng.uniform([num_samples],
+                                     minval=tf.zeros_like(wedges_angle),
+                                     maxval=wedges_angle,
+                                     dtype=self._rdtype)
 
         return phis
 
@@ -2628,6 +3739,9 @@ class SolverCoverageMap(SolverBase):
         # Weighting
         # [num_tx, num_samples]
         diff_samples_weights = tf.linalg.norm(cross(ds_dl, ds_dphi), axis=-1)
+        diff_samples_weights = tf.where(tf.math.is_inf(diff_samples_weights),
+                                        tf.zeros((), self._rdtype),
+                                        diff_samples_weights)
 
         return diff_samples_weights
 
@@ -2661,8 +3775,8 @@ class SolverCoverageMap(SolverBase):
 
         combining_vec : [num_rx_ant], tf.complex
             Combining vector.
-            This is used to combine the signal from the receive antennas for
-            an imaginary receiver located on the coverage map.
+            If set to `None`, then no combining is applied, and
+            the energy received by all antennas is summed.
 
         precoding_vec : [num_tx or 1, num_tx_ant], tf.complex
             Precoding vectors of the transmitters
@@ -3031,19 +4145,25 @@ class SolverCoverageMap(SolverBase):
         a = self._apply_synthetic_array(tx_rot_mat, rx_rot_mat, -s_hat,
                                         s_prime_hat, a)
 
-        # Apply spatial precoding and combining
+        # Apply precoding
         # Precoding and combing
-        # [1, 1, num_rx_ant]
-        combining_vec = insert_dims(combining_vec, 2, 0)
         # [num_tx/1, 1, 1, num_tx_ant]
         precoding_vec = insert_dims(precoding_vec, 2, 1)
         # [num_tx, samples_per_tx, num_rx_ant]
         a = tf.reduce_sum(a*precoding_vec, axis=-1)
-        # [num_tx, samples_per_tx]
-        a = tf.reduce_sum(tf.math.conj(combining_vec)*a, axis=-1)
-
-        # [num_tx, samples_per_tx]
-        a = tf.square(tf.abs(a))
+        # Apply combining
+        # If no combining vector is set, then the energy of all antennas is
+        # summed
+        if combining_vec is None:
+            # [num_tx, samples_per_tx]
+            a = tf.reduce_sum(tf.square(tf.abs(a)), axis=-1)
+        else:
+            # [1, 1, num_rx_ant]
+            combining_vec = insert_dims(combining_vec, 2, 0)
+            # [num_tx, samples_per_tx]
+            a = tf.reduce_sum(tf.math.conj(combining_vec)*a, axis=-1)
+            # [num_tx, samples_per_tx]
+            a = tf.square(tf.abs(a))
 
         # [num_tx, samples_per_tx]
         cst = tf.square(self._scene.wavelength/(4.*PI))
@@ -3229,8 +4349,8 @@ class SolverCoverageMap(SolverBase):
 
         combining_vec : [num_rx_ant], tf.complex
             Combining vector.
-            This is used to combine the signal from the receive antennas for
-            an imaginary receiver located on the coverage map.
+            If set to `None`, then no combining is applied, and
+            the energy received by all antennas is summed.
 
         precoding_vec : [num_tx or 1, num_tx_ant], tf.complex
             Precoding vectors of the transmitters

@@ -1,11 +1,12 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Layers for scrambling, descrambling and utility functions."""
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
+from sionna import config
 from sionna.utils import expand_to_rank
 from sionna.nr.utils import generate_prng_seq
 
@@ -290,10 +291,10 @@ class Scrambler(Layer):
         else:
             # generate new seed for each call
             # Note: not necessarily random if XLA is active
-            seed = tf.random.uniform([2],
-                                     minval=0,
-                                     maxval=2**31-1,
-                                     dtype=tf.int32)
+            seed = config.tf_rng.uniform([2],
+                                         minval=0,
+                                         maxval=2**31-1,
+                                         dtype=tf.int32)
 
         # apply sequence if explicit sequence is provided
         if self._sequence is not None:

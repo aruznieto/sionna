@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Layers for LDPC channel encoding and utility functions."""
@@ -292,8 +292,8 @@ class LDPC5GEncoder(Layer):
         num_bits_per_symbol: int
             Number of symbols per QAM symbol, i.e., the modulation order.
 
-        Outputs
-        -------
+        Output
+        ------
         (perm_seq, perm_seq_inv):
             Tuple:
 

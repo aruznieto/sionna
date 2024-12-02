@@ -1,10 +1,9 @@
-tensorflow >=2.10.1, !=2.11.0, <2.14.0 ; sys_platform != "darwin"
-tensorflow-macos >=2.10, <2.14.0 ; sys_platform == "darwin"
+tensorflow >=2.13.0, <2.16.0
 numpy
 scipy >=1.6.0
-matplotlib
+matplotlib >= 3.5.3
 importlib_resources
-mitsuba >= 3.2.0
+mitsuba >= 3.2.0, <3.6.0
 pythreejs >= 2.4.2
 ipywidgets >= 8.0.4
 ipydatawidgets == 4.3.2

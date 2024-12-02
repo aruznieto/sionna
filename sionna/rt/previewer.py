@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """
@@ -13,7 +13,8 @@ from ipywidgets.embed import embed_snippet
 import pythreejs as p3s
 import matplotlib
 
-from .utils import paths_to_segments, scene_scale, rotate
+from .utils import paths_to_segments, scene_scale, rotate,\
+    mitsuba_rectangle_to_world
 from .renderer import coverage_map_color_mapping
 
 
@@ -92,6 +93,21 @@ class InteractiveDisplay:
                 self._p3s_scene.remove(obj)
         self._objects = remaining
 
+    def redraw_scene_geometry(self):
+        """
+        Redraw the scene geometry.
+        """
+        remaining = []
+        for obj, persist in self._objects:
+            if not persist: # Only scene objects are flagged as persistent
+                remaining.append((obj, persist))
+            else:
+                self._p3s_scene.remove(obj)
+        self._objects = remaining
+
+        # Plot the scene geometry
+        self.plot_scene()
+
     def center_view(self):
         """
         Automatically place the camera based on the scene's bounding box such
@@ -121,15 +137,18 @@ class InteractiveDisplay:
             Defaults to `False`.
         """
         scene = self._scene
-        sc, tx_positions, rx_positions, _ = scene_scale(scene)
+        sc, tx_positions, rx_positions, _, _ = scene_scale(scene)
         transmitter_colors = [transmitter.color.numpy() for
                               transmitter in scene.transmitters.values()]
         receiver_colors = [receiver.color.numpy() for
                            receiver in scene.receivers.values()]
 
         # Radio emitters, shown as points
-        p = np.array(list(tx_positions.values()) + list(rx_positions.values()))
-        albedo = np.array(transmitter_colors + receiver_colors)
+        p = np.array(list(tx_positions.values()) +
+                     list(rx_positions.values())
+                      )
+        albedo = np.array(transmitter_colors +
+                          receiver_colors)
 
         if p.shape[0] > 0:
             # Radio devices are not persistent
@@ -142,7 +161,8 @@ class InteractiveDisplay:
             zeros = np.zeros((1, 3))
 
             for devices in [scene.transmitters.values(),
-                            scene.receivers.values()]:
+                            scene.receivers.values(),
+                            scene.ris.values()]:
                 if len(devices) == 0:
                     continue
                 starts, ends = [], []
@@ -197,23 +217,29 @@ class InteractiveDisplay:
         si.wi = mi.Vector3f(0, 0, 1)
 
         # Shapes (e.g. buildings)
-        vertices, faces, albedos = [None] * n, [None] * n, [None] * n
+        vertices, faces, albedos = [], [], []
         f_offset = 0
         for i, s in enumerate(shapes):
+            null_transmission = s.bsdf().eval_null_transmission(si).numpy()
+            if np.min(null_transmission) > 0.99:
+                # The BSDF for this shape was probably set to `null`, do not
+                # include it in the scene preview.
+                continue
+
             n_vertices = s.vertex_count()
             v = s.vertex_position(dr.arange(mi.UInt32, n_vertices))
-            vertices[i] = v.numpy()
+            vertices.append(v.numpy())
             f = s.face_indices(dr.arange(mi.UInt32, s.face_count()))
-            faces[i] = f.numpy() + f_offset
+            faces.append(f.numpy() + f_offset)
             f_offset += n_vertices
 
             albedo = s.bsdf().eval_diffuse_reflectance(si).numpy()
             if not np.any(albedo > 0.):
                 if palette is None:
-                    palette = matplotlib.cm.get_cmap('Pastel1_r')
+                    palette = matplotlib.colormaps.get_cmap('Pastel1_r')
                 albedo[:] = palette((i % palette.N + 0.5) / palette.N)[:3]
 
-            albedos[i] = np.tile(albedo, (n_vertices, 1))
+            albedos.append(np.tile(albedo, (n_vertices, 1)))
 
         # Plot all objects as a single PyThreeJS mesh, which is must faster
         # than creating individual mesh objects in large scenes.
@@ -223,7 +249,7 @@ class InteractiveDisplay:
                         colors=np.concatenate(albedos, axis=0))
 
     def plot_coverage_map(self, coverage_map, tx=0, db_scale=True,
-                          vmin=None, vmax=None):
+                          vmin=None, vmax=None, metric="path_gain"):
         """
         Plot the coverage map as a textured rectangle in the scene. Regions
         where the coverage map is zero-valued are made transparent.
@@ -232,7 +258,11 @@ class InteractiveDisplay:
         # coverage_map = resample_to_corners(
         #     coverage_map[tx, :, :].numpy()
         # )
-        coverage_map = coverage_map[tx, :, :].numpy()
+        cm = getattr(coverage_map, metric).numpy()
+        if tx is None:
+            coverage_map = np.max(cm, axis=0)
+        else:
+            coverage_map = cm[tx]
 
         # Create a rectangle from two triangles
         p00 = to_world.transform_affine([-1, -1, 0])
@@ -284,6 +314,68 @@ class InteractiveDisplay:
 
         self._add_child(mesh, pmin, pmax, persist=False)
 
+    def plot_ris(self):
+        """
+        Plot all RIS as a monochromatic rectangle in the scene
+        """
+        all_ris = list(self._scene.ris.values())
+
+        for ris in all_ris:
+            orientation = ris.orientation
+            to_world =\
+                mitsuba_rectangle_to_world(ris.position, orientation, ris.size,
+                                           ris=True)
+            color = ris.color.numpy()
+
+            # Create a rectangle from two triangles
+            p00 = to_world.transform_affine([-1, -1, 0])
+            p01 = to_world.transform_affine([1, -1, 0])
+            p10 = to_world.transform_affine([-1, 1, 0])
+            p11 = to_world.transform_affine([1, 1, 0])
+
+            vertices = np.array([p00, p01, p10, p11])
+            pmin = np.min(vertices, axis=0)
+            pmax = np.max(vertices, axis=0)
+
+            faces = np.array([
+                [0, 1, 2],
+                [2, 1, 3],
+            ], dtype=np.uint32)
+
+            geo = p3s.BufferGeometry(
+                attributes={
+                    'position': p3s.BufferAttribute(vertices,
+                                                    normalized=False),
+                    'index': p3s.BufferAttribute(faces.ravel(),
+                                                 normalized=False),
+                }
+            )
+
+            color = f'rgb({", ".join([str(int(v*255)) for v in color])})'
+            mat = p3s.MeshLambertMaterial(color=color, side='DoubleSide')
+            mesh = p3s.Mesh(geo, mat)
+
+            self._add_child(mesh, pmin, pmax, persist=False)
+
+    def set_clipping_plane(self, offset, orientation):
+        """
+        Input
+        -----
+        clip_at : float
+            If not `None`, the scene preview will be clipped (cut) by a plane
+            with normal orientation ``clip_plane_orientation`` and offset
+            ``clip_at``. This allows visualizing the interior of meshes such
+            as buildings.
+
+        clip_plane_orientation : tuple[float, float, float]
+            Normal vector of the clipping plane.
+        """
+        if offset is None:
+            self._renderer.localClippingEnabled = False
+            self._renderer.clippingPlanes = []
+        else:
+            self._renderer.localClippingEnabled = True
+            self._renderer.clippingPlanes = [p3s.Plane(orientation, offset)]
 
     @property
     def camera(self):

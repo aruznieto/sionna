@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Functions related to OFDM channel estimation"""
@@ -910,8 +910,7 @@ class LMMSEInterpolator1D:
                             indices = [tx, st, oi, num_pil, num_pil]
                             add_err_var_indices[tx, st, oi, ii] = indices
                             num_pil += 1
-                    if num_pil > max_num_pil:
-                        max_num_pil = num_pil
+                    max_num_pil = max(max_num_pil, num_pil)
         # [num_tx, num_streams_per_tx, outer_dim_size, inner_dim_size, 5]
         self._add_err_var_indices = tf.cast(add_err_var_indices, tf.int32)
 
@@ -1713,7 +1712,7 @@ class LMMSEInterpolator(BaseChannelInterpolator):
                 err_var_mask = tf.cast(pilot_mask == 1,
                                             cov_mat_freq.dtype.real_dtype)
             # Space
-            elif o == 's':
+            else:
                 interpolator = SpatialChannelFilter(cov_mat_space,
                                                     last_step=last_step)
                 err_var_mask = tf.cast(pilot_mask == 1,
@@ -1934,7 +1933,7 @@ def tdl_freq_cov_mat(model, subcarrier_spacing, fft_size, delay_spread,
         parameters_fname = "TDL-C.json"
     elif model == 'D':
         parameters_fname = "TDL-D.json"
-    elif model == 'E':
+    else: # 'E'
         parameters_fname = "TDL-E.json"
     source = files(models).joinpath(parameters_fname)
     # pylint: disable=unspecified-encoding
@@ -2060,7 +2059,7 @@ def tdl_time_cov_mat(model, speed, carrier_frequency, ofdm_symbol_duration,
         parameters_fname = "TDL-C.json"
     elif model == 'D':
         parameters_fname = "TDL-D.json"
-    elif model == 'E':
+    else: # 'E'
         parameters_fname = "TDL-E.json"
     source = files(models).joinpath(parameters_fname)
     # pylint: disable=unspecified-encoding

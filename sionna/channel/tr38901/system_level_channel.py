@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Base class for implementing system level channel models from 3GPP TR38.901
@@ -60,7 +60,7 @@ class SystemLevelChannel(ChannelModel):
         if scenario.direction == "uplink":
             tx_array = scenario.ut_array
             rx_array = scenario.bs_array
-        elif scenario.direction == "downlink":
+        else: # "downlink"
             tx_array = scenario.bs_array
             rx_array = scenario.ut_array
         self._cir_sampler = ChannelCoefficientsGenerator(
@@ -177,7 +177,7 @@ class SystemLevelChannel(ChannelModel):
             moving_end = 'rx'
             tx_orientations = self._scenario.bs_orientations
             rx_orientations = self._scenario.ut_orientations
-        elif self._scenario.direction == 'uplink':
+        else : # 'uplink'
             moving_end = 'tx'
             tx_orientations = self._scenario.ut_orientations
             rx_orientations = self._scenario.bs_orientations

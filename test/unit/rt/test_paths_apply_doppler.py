@@ -1,35 +1,17 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-
-try:
-    import sionna
-except ImportError as e:
-    import sys
-    sys.path.append("..")
-    import sionna
 
 import unittest
 import numpy as np
 import tensorflow as tf
 from tensorflow.experimental.numpy import swapaxes
-
-gpus = tf.config.list_physical_devices('GPU')
-print('Number of GPUs available :', len(gpus))
-if gpus:
-    gpu_num = 0
-    try:
-        tf.config.set_visible_devices(gpus[gpu_num], 'GPU')
-        print('Only GPU number', gpu_num, 'used.')
-        tf.config.experimental.set_memory_growth(gpus[gpu_num], True)
-    except RuntimeError as e:
-        print(e)
-
 import sionna
 from sionna.rt import load_scene, Transmitter, Receiver, PlanarArray
+from sionna.rt.utils import r_hat
 from sionna.channel import cir_to_ofdm_channel, subcarrier_frequencies
-from sionna.signal import fft, ifft
+from sionna.signal import fft
 from sionna.constants import SPEED_OF_LIGHT
 
 def compute_doppler_spectrum(scene, paths, tx_velocities, rx_velocities):
@@ -249,3 +231,26 @@ class TestApplyDoppler(unittest.TestCase):
                 for k in range(scene.rx_array.num_ant):
                     for l in range(scene.tx_array.num_ant):
                         self.assertTrue(tf.reduce_all(ref==ds[i,k,j,l]))
+
+    def test_moving_reflector(self):
+        """Test that moving reflector has the right Doppler shift"""
+        scene = load_scene(sionna.rt.scene.simple_reflector)
+        scene.get("reflector").velocity = [0, 0, -20]
+        scene.tx_array = PlanarArray(1,1,0.5,0.5,"iso","V")
+        scene.rx_array = scene.tx_array
+        scene.add(Transmitter("tx", [-25,0.1,50]))
+        scene.add(Receiver("rx",    [ 25,0.1,50]))      
+        
+        # Compute the reflected path
+        paths = scene.compute_paths(max_depth=1, los=False)
+
+        # Compute theoretical Doppler shift for this path
+        theta_t = tf.squeeze(paths.theta_t)
+        phi_t = tf.squeeze(paths.phi_t)
+        k_0 = r_hat(theta_t, phi_t)
+        theta_r = tf.squeeze(paths.theta_r)
+        phi_r = tf.squeeze(paths.phi_r)
+        k_1 = -r_hat(theta_r, phi_r)
+        doppler_theo = np.sum((k_1-k_0)*scene.get("reflector").velocity)/scene.wavelength
+
+        self.assertAlmostEqual(tf.squeeze(paths.doppler), doppler_theo)

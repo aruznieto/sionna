@@ -1,10 +1,20 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Utility functions used for testing of the sionna.rt module"""
 
+try:
+    import sionna
+except ImportError as e:
+    import sys
+    sys.path.append("../..")
+    import sionna
+
+from sionna import config
+
 import numpy as np
+
 
 def normalize(v, return_norm=False):
     """Normalizes a vector and optionally returns its norm"""
@@ -81,7 +91,7 @@ def compute_field_component_vectors(k_i, k_r, n_hat):
     # Basis vectors in the incoming plane
     e_i_s = cross(k_i, n_hat)
     if np.sum(np.abs(e_i_s))<1e-4: # In case of normal incidence e_i_s is not uniquely defined, so we select a random orientation
-        e_i_s = cross(n_hat+np.random.normal([3]), n_hat)
+        e_i_s = cross(n_hat+config.np_rng.normal([3]), n_hat)
     e_i_s = normalize(e_i_s)
     e_i_p = normalize(cross(e_i_s, k_i))
 
@@ -118,7 +128,10 @@ def validate_path(path_ind, paths, scene):
     for i in objects:
         if i==-1:
             break
-        etas.append(list(scene.objects.values())[i].radio_material.complex_relative_permittivity.numpy())
+        for obj in list(scene.objects.values()):
+            if obj.object_id == i:
+                etas.append(obj.radio_material.complex_relative_permittivity.numpy())
+                break
 
     num_bounces = len(etas)
     num_paths = paths.spec_tmp.normals.shape[2]
@@ -147,7 +160,7 @@ def validate_path(path_ind, paths, scene):
             else:
                 end_point = vertices[i+1]
 
-            # Compute incomning and reflected wave vectors
+            # Compute incoming and reflected wave vectors
             k_i = normalize(hit_point - start_point)
             k_r = normalize(end_point - hit_point)
 

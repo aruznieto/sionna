@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Utility functions for the filter module"""
@@ -88,7 +88,7 @@ def convolve(inp, ker, padding='full', axis=-1):
     elif padding == 'same':
         ker = tf.pad(ker, [[0,1],[0,0],[0,0]])
         tf_conv_mode = 'SAME'
-    elif padding == 'full':
+    else: # 'full'
         ker_len = ker.shape[0] #tf.shape(ker)[0]
         if (ker_len % 2) == 0:
             extra_padding_left = ker_len // 2

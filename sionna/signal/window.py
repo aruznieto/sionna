@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Layers implementing windowing functions"""
@@ -182,7 +182,7 @@ class Window(ABC, Layer):
 
         if x_dtype.is_floating:
             y = x*w
-        elif x_dtype.is_complex:
+        else: # Complex
             w = tf.complex(w, tf.zeros_like(w))
             y = w*x
 
